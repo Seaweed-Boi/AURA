@@ -57,14 +57,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 # All CSV files in the MachineLearningCVE folder, ordered by weekday.
 CSV_FILES: List[str] = [
-    "C:\Users\Student2\AURA\dataset\Monday-WorkingHours.pcap_ISCX.csv",
-    "C:\Users\Student2\AURA\dataset\Tuesday-WorkingHours.pcap_ISCX.csv",
-    "C:\Users\Student2\AURA\dataset\Wednesday-workingHours.pcap_ISCX.csv",
-    "C:\Users\Student2\AURA\dataset\Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv",
-    "C:\Users\Student2\AURA\dataset\Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv",
-    "C:\Users\Student2\AURA\dataset\Friday-WorkingHours-Morning.pcap_ISCX.csv",
-    "C:\Users\Student2\AURA\dataset\Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
-    "C:\Users\Student2\AURA\dataset\Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv",
+    "dataset\Monday-WorkingHours.pcap_ISCX.csv",
+    "dataset\Tuesday-WorkingHours.pcap_ISCX.csv",
+    "dataset\Wednesday-workingHours.pcap_ISCX.csv",
+    "dataset\Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv",
+    "dataset\Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv",
+    "dataset\Friday-WorkingHours-Morning.pcap_ISCX.csv",
+    "dataset\Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
+    "dataset\Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
