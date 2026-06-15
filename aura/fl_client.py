@@ -476,11 +476,10 @@ def create_mock_clients(
             # rather than noise-level drift that gets masked by random init variance.
             n_attack = int(n_samples * 0.8)
             attack_rows = torch.rand(n_attack, feature_dim)
-            # Spike all major feature blocks to max range
-            attack_rows[:, :20]  = torch.rand(n_attack, 20) * 0.5 + 0.5   # flow stats
-            attack_rows[:, 20:40] = torch.rand(n_attack, 20) * 0.4 + 0.6  # packet stats
-            attack_rows[:, 40:60] = torch.rand(n_attack, 20) * 0.6 + 0.4  # flag counts
-            attack_rows[:, 60:]  = torch.rand(n_attack, feature_dim - 60) * 0.9 + 0.1
+            # Spike all major feature blocks to max range (47 NF-UNSW features)
+            attack_rows[:, :16]  = torch.rand(n_attack, 16) * 0.5 + 0.5   # proto/volume/flags
+            attack_rows[:, 16:32] = torch.rand(n_attack, 16) * 0.4 + 0.6  # pkt size/throughput
+            attack_rows[:, 32:]  = torch.rand(n_attack, feature_dim - 32) * 0.6 + 0.4  # IAT/app
             train_data[:n_attack] = attack_rows
             logger.info(f"[{client_id}] Strong attack injection: {n_attack}/{n_samples} samples poisoned.")
 
@@ -527,8 +526,8 @@ def start_client(
         # Adversarial client: poisoned data with extreme feature values
         n_attack = n_samples // 5
         attack_rows = torch.rand(n_attack, feature_dim)
-        attack_rows[:, [2, 3, 15]] = torch.rand(n_attack, 3) * 0.3 + 0.7
-        attack_rows[:, [4, 5, 63]] = torch.rand(n_attack, 3) * 0.2 + 0.8
+        attack_rows[:, [2, 3, 6]] = torch.rand(n_attack, 3) * 0.3 + 0.7   # in_bytes, in_pkts, tcp_flags
+        attack_rows[:, [4, 5, 9]] = torch.rand(n_attack, 3) * 0.2 + 0.8   # out_bytes, out_pkts, flow_dur
         train_data[:n_attack] = attack_rows
         logger.info(f"[{client_id}] Byzantine mode — poisoned data injected.")
 
