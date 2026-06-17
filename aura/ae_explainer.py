@@ -1,32 +1,40 @@
 """
-aura/ae_explainer.py — AE Feature Attribution & Attack Classification
-=======================================================================
+aura/ae_explainer.py — AE Feature Attribution & Attack Classification (RF)
+===========================================================================
 
-Given a per-feature reconstruction residual vector |x - x_hat| ∈ ℝ^47,
+Given a per-feature reconstruction residual vector |x - x_hat|,
 this module:
 
-  1. Names the top contributing features in human-readable terms
-  2. Matches the residual pattern against known attack signatures
-  3. Produces a plain-English explanation panel for the SOC operator
+  1. Loads a pre-trained RandomForest diagnostic classifier from
+     saved_models/explainer_rf.pkl
+  2. Predicts the attack type and confidence from the residual pattern
+  3. Extracts feature importances × live residuals to compute live_impact
+  4. Names the top contributing features in human-readable terms
+  5. Produces a plain-English explanation panel for the SOC operator
 
 Design
 ------
-We use a lightweight dot-product similarity between the (normalized) residual
-vector and pre-defined attack signature vectors.  Each signature encodes which
-features SHOULD be anomalous for that attack type, weighted by expected severity.
-No additional model is needed — it's a lookup/scoring pass on top of the AE.
+The RF classifier was trained on per-sample absolute residual vectors
+(|x - x_hat|) from known attack traffic.  At inference time:
+  - predict()       → attack type string
+  - predict_proba() → confidence score
+  - feature_importances_ × live_residual → per-feature live_impact
 
-This is interpretable-by-design: the operator can see exactly WHICH features
-drove the alert AND why the system inferred a specific attack category.
+This replaces the earlier cosine-similarity signature matching approach
+with a data-driven classifier that learns the residual patterns directly.
 """
 
+import logging
 import numpy as np
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Feature Index → Human-Readable Name
-# All 47 NF-UNSW-NB15-v3 features (IPs, ports, timestamps, Label, Attack stripped)
+# All NF-UNSW-NB15-v3 features (IPs, ports, timestamps, Label, Attack stripped)
 # ─────────────────────────────────────────────────────────────────────────────
 
 FEATURE_NAMES: Dict[int, str] = {
@@ -91,123 +99,6 @@ FEATURE_GROUPS: Dict[str, List[int]] = {
     "Packet Size":        [14, 15, 16, 17, 26, 27, 28, 29, 30],
     "Application Layer":  [1, 33, 34, 35, 36, 37, 38],
     "Window / TTL":       [12, 13, 31, 32],
-}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Attack Signature Vectors
-# ─────────────────────────────────────────────────────────────────────────────
-# Each signature is a sparse dict: {feature_index: expected_high_residual_weight}
-# Values are relative importances — they get L2-normalised at match time.
-# Based on the NF-UNSW-NB15-v3 attack taxonomy + attack_injector.py profiles.
-
-ATTACK_SIGNATURES: Dict[str, Dict[int, float]] = {
-    "DoS": {
-        3:  1.0,   # Inbound Packets (flood)
-        5:  0.9,   # Outbound Packets
-        18: 0.9,   # Src→Dst Bytes/s
-        41: 0.8,   # Src→Dst IAT Avg (near-zero = flood)
-        42: 0.7,   # Src→Dst IAT Stddev
-        6:  0.8,   # TCP Flags (SYN flood)
-        9:  0.6,   # Flow Duration (short)
-    },
-    "Reconnaissance": {
-        9:  1.0,   # Flow Duration (very short probes)
-        2:  0.8,   # Inbound Bytes (minimal)
-        4:  0.8,   # Outbound Bytes (minimal)
-        6:  0.9,   # TCP Flags (SYN probes)
-        26: 0.7,   # Pkts ≤128 Bytes (small packets)
-        18: 0.5,   # Src→Dst Bytes/s (low)
-    },
-    "Exploits": {
-        2:  0.9,   # Inbound Bytes
-        14: 1.0,   # Longest Flow Pkt (oversized payloads)
-        6:  0.7,   # TCP Flags
-        9:  0.6,   # Flow Duration
-        20: 0.8,   # Retransmitted In Bytes (instability)
-        42: 0.6,   # Src→Dst IAT Stddev
-    },
-    "Fuzzers": {
-        2:  0.8,   # Inbound Bytes
-        3:  0.9,   # Inbound Packets
-        14: 0.9,   # Longest Flow Pkt
-        15: 0.7,   # Shortest Flow Pkt (mixed sizes)
-        42: 1.0,   # Src→Dst IAT Stddev (chaotic)
-        0:  0.6,   # Protocol (unusual)
-    },
-    "Generic": {
-        2:  0.8,   # Inbound Bytes
-        4:  0.8,   # Outbound Bytes
-        6:  0.7,   # TCP Flags
-        9:  0.6,   # Flow Duration
-        18: 0.7,   # Src→Dst Bytes/s
-        42: 0.5,   # Src→Dst IAT Stddev
-    },
-    "Backdoor": {
-        9:  0.8,   # Flow Duration (long sessions)
-        2:  0.7,   # Inbound Bytes
-        4:  0.7,   # Outbound Bytes (symmetric C2)
-        41: 1.0,   # Src→Dst IAT Avg (periodic beaconing)
-        42: 0.9,   # Src→Dst IAT Stddev (robotic regularity)
-        45: 0.9,   # Dst→Src IAT Avg
-        46: 0.9,   # Dst→Src IAT Stddev
-    },
-    "Shellcode": {
-        2:  1.0,   # Inbound Bytes (payload delivery)
-        14: 0.9,   # Longest Flow Pkt
-        6:  0.7,   # TCP Flags
-        9:  0.6,   # Flow Duration (short burst)
-        7:  0.8,   # Client TCP Flags (PSH)
-    },
-    "Worms": {
-        3:  0.9,   # Inbound Packets (propagation)
-        5:  0.9,   # Outbound Packets (propagation)
-        18: 1.0,   # Src→Dst Bytes/s
-        19: 0.8,   # Dst→Src Bytes/s
-        9:  0.7,   # Flow Duration
-        6:  0.6,   # TCP Flags
-    },
-    "Analysis": {
-        9:  1.0,   # Flow Duration (extended probing)
-        2:  0.6,   # Inbound Bytes
-        4:  0.6,   # Outbound Bytes
-        41: 0.8,   # Src→Dst IAT Avg
-        42: 0.7,   # Src→Dst IAT Stddev
-        26: 0.5,   # Pkts ≤128 Bytes
-    },
-    "Data Exfiltration": {
-        2:  1.0,   # Inbound Bytes (large outbound)
-        18: 0.9,   # Src→Dst Bytes/s
-        9:  0.8,   # Flow Duration (sustained)
-        41: 0.7,   # Src→Dst IAT Avg (regulated pacing)
-        42: 0.6,   # Src→Dst IAT Stddev (robotic)
-        4:  0.5,   # Outbound Bytes (near-zero return)
-        19: 0.5,   # Dst→Src Bytes/s
-    },
-    "Lateral Movement": {
-        42: 1.0,   # Src→Dst IAT Stddev (high jitter)
-        10: 0.9,   # Duration In (beacon-like)
-        9:  0.8,   # Flow Duration
-        3:  0.7,   # Inbound Packets
-        46: 0.6,   # Dst→Src IAT Stddev
-        7:  0.5,   # Client TCP Flags
-    },
-    "Port Scan": {
-        6:  1.0,   # TCP Flags (RST/SYN)
-        7:  0.9,   # Client TCP Flags
-        9:  0.8,   # Flow Duration (very short)
-        2:  0.7,   # Inbound Bytes (minimal)
-        4:  0.7,   # Outbound Bytes (minimal)
-        18: 0.5,   # Src→Dst Bytes/s
-    },
-    "Web Attack": {
-        2:  0.9,   # Inbound Bytes
-        4:  0.8,   # Outbound Bytes
-        7:  1.0,   # Client TCP Flags (PSH)
-        8:  0.9,   # Server TCP Flags
-        9:  0.7,   # Flow Duration (short bursts)
-        41: 0.6,   # Src→Dst IAT Avg
-    },
 }
 
 
@@ -382,8 +273,8 @@ ATTACK_EXPLANATIONS: Dict[str, Dict[str, str]] = {
         "icon":    "❓",
         "summary": "Anomalous pattern — no close attack signature match",
         "detail":  (
-            "The reconstruction error is elevated but the feature residual pattern "
-            "does not closely match any known attack signature. This may indicate "
+            "The reconstruction error is elevated but the residual pattern "
+            "does not closely match any known attack class. This may indicate "
             "a novel attack variant, misconfigured device, or legitimate but unusual "
             "traffic pattern. "
             "Action: review the top contributing features manually and escalate "
@@ -396,42 +287,86 @@ ATTACK_EXPLANATIONS: Dict[str, Dict[str, str]] = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RF Classifier — Lazy Loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RF_CACHE = None
+
+
+def _load_rf_classifier():
+    """
+    Lazy-load the trained RandomForest diagnostic classifier.
+    Returns None if the model file does not exist (graceful fallback).
+    """
+    global _RF_CACHE
+    if _RF_CACHE is not None:
+        return _RF_CACHE
+
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    import config as cfg
+
+    rf_path = cfg.MODELS_DIR / "explainer_rf.pkl"
+
+    if not rf_path.exists():
+        logger.warning(
+            f"Explainer RF model not found at {rf_path}.  "
+            "Run `python scripts/train_explainer.py` to train it.  "
+            "Falling back to residual-only explanation (no attack classification)."
+        )
+        return None
+
+    try:
+        import joblib
+        _RF_CACHE = joblib.load(str(rf_path))
+        logger.info(f"Loaded explainer RF from {rf_path}  "
+                     f"(classes={list(_RF_CACHE.classes_)})")
+    except Exception as e:
+        logger.error(f"Failed to load explainer RF: {e}")
+        return None
+
+    return _RF_CACHE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Core Explanation Function
 # ─────────────────────────────────────────────────────────────────────────────
 
 def explain_ae(
-    residuals:  np.ndarray,   # [47] mean absolute per-feature residual
+    residuals:  np.ndarray,   # [F] mean absolute per-feature residual
     top_k:      int = 5,
-    min_score:  float = 0.05, # minimum similarity to claim a match
 ) -> Dict:
     """
     Given a per-feature reconstruction residual vector, return a structured
     explanation dict for the dashboard.
 
+    Strategy
+    --------
+    1. Load the RF classifier (lazy, cached).
+    2. Run predict() → attack type string.
+    3. Run predict_proba() → confidence score for the predicted class.
+    4. Compute live_impact = feature_importances_ × residuals.
+    5. Rank features by live_impact and return top_features.
+
+    If the RF model is not available, falls back to ranking features by
+    raw residual magnitude (graceful degradation).
+
     Parameters
     ----------
-    residuals  : np.ndarray [47] — mean |x - x_hat| per feature
+    residuals  : np.ndarray [F] — mean |x - x_hat| per feature
     top_k      : how many top features to surface
-    min_score  : cosine similarity threshold below which we say "Unknown"
 
     Returns
     -------
     dict with keys:
       top_features    : list of (feature_name, residual_value, feature_index)
       group_residuals : dict {group_name: mean_residual}
-      inferred_attack : str — matched attack label (or "Unknown Anomaly")
-      match_score     : float ∈ [0,1]
+      inferred_attack : str — predicted attack label (or "Unknown Anomaly")
+      match_score     : float ∈ [0,1] — RF confidence for predicted class
       explanation     : dict (icon, summary, detail, why_high)
     """
     residuals = np.array(residuals, dtype=np.float32)
     n_feats   = len(residuals)
-
-    # ── Top-K contributing features ───────────────────────────────────────
-    top_indices = np.argsort(residuals)[::-1][:top_k]
-    top_features = [
-        (FEATURE_NAMES.get(int(i), f"Feature_{i}"), float(residuals[i]), int(i))
-        for i in top_indices
-    ]
 
     # ── Group-level residuals ─────────────────────────────────────────────
     group_residuals: Dict[str, float] = {}
@@ -439,37 +374,63 @@ def explain_ae(
         valid = [residuals[i] for i in indices if i < n_feats]
         group_residuals[group_name] = float(np.mean(valid)) if valid else 0.0
 
-    # ── Attack signature matching (cosine similarity) ─────────────────────
-    # Build a dense residual vector from the sparse signature
-    best_attack = "Unknown Anomaly"
-    best_score  = 0.0
+    # ── RF-based attack classification ────────────────────────────────────
+    clf = _load_rf_classifier()
 
-    r_norm = np.linalg.norm(residuals)
-    if r_norm > 1e-8:
-        r_unit = residuals / r_norm
+    if clf is not None:
+        # Reshape for sklearn: [1, F]
+        residual_input = residuals.reshape(1, -1)
 
-        for attack_name, sig_dict in ATTACK_SIGNATURES.items():
-            # Build dense signature vector
-            sig_vec = np.zeros(n_feats, dtype=np.float32)
-            for feat_idx, weight in sig_dict.items():
-                if feat_idx < n_feats:
-                    sig_vec[feat_idx] = weight
+        # Handle dimension mismatch: pad or truncate to match RF's expected
+        # feature count (covers both 43-feature and 47-feature scenarios).
+        expected_feats = clf.n_features_in_
+        if residual_input.shape[1] < expected_feats:
+            pad = np.zeros((1, expected_feats - residual_input.shape[1]),
+                           dtype=np.float32)
+            residual_input = np.concatenate([residual_input, pad], axis=1)
+        elif residual_input.shape[1] > expected_feats:
+            residual_input = residual_input[:, :expected_feats]
 
-            sig_norm = np.linalg.norm(sig_vec)
-            if sig_norm < 1e-8:
-                continue
+        # Predict attack type and confidence
+        predicted_attack = clf.predict(residual_input)[0]
+        proba = clf.predict_proba(residual_input)[0]
+        class_idx = list(clf.classes_).index(predicted_attack)
+        confidence = float(proba[class_idx])
 
-            sig_unit = sig_vec / sig_norm
-            score    = float(np.dot(r_unit, sig_unit))   # cosine similarity
+        # Compute live_impact: feature_importances × live residual
+        importances = clf.feature_importances_
+        # Align importances with the actual residual length
+        imp_len = min(len(importances), n_feats)
+        live_impact = np.zeros(n_feats, dtype=np.float32)
+        live_impact[:imp_len] = importances[:imp_len] * residuals[:imp_len]
 
-            if score > best_score:
-                best_score  = score
-                best_attack = attack_name
+        # Top-K features by live_impact
+        top_indices = np.argsort(live_impact)[::-1][:top_k]
+        top_features = [
+            (FEATURE_NAMES.get(int(i), f"Feature_{i}"),
+             float(residuals[i]),
+             int(i))
+            for i in top_indices
+        ]
 
-    if best_score < min_score:
+        best_attack = str(predicted_attack)
+        best_score  = confidence
+
+    else:
+        # ── Fallback: rank by raw residual magnitude ──────────────────────
+        top_indices = np.argsort(residuals)[::-1][:top_k]
+        top_features = [
+            (FEATURE_NAMES.get(int(i), f"Feature_{i}"),
+             float(residuals[i]),
+             int(i))
+            for i in top_indices
+        ]
         best_attack = "Unknown Anomaly"
+        best_score  = 0.0
 
-    explanation = ATTACK_EXPLANATIONS.get(best_attack, ATTACK_EXPLANATIONS["Unknown Anomaly"])
+    explanation = ATTACK_EXPLANATIONS.get(
+        best_attack, ATTACK_EXPLANATIONS["Unknown Anomaly"]
+    )
 
     return {
         "top_features":    top_features,
