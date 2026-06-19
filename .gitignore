@@ -37,3 +37,7 @@ Desktop.ini
 
 #dataset
 dataset/
+
+# React frontend
+frontend/node_modules/
+frontend/dist/

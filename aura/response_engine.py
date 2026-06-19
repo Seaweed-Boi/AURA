@@ -249,7 +249,7 @@ class AURAResponseEngine:
 
         if reason is None:
             reason = (
-                f"Confidence {event.confidence:.2%} ≥ {cfg.CONFIDENCE_MED_THRESHOLD:.2%}. "
+                f"Confidence {event.confidence:.2%} >= {cfg.CONFIDENCE_MED_THRESHOLD:.2%}. "
                 f"Bandwidth throttled via policy engine.  HITL analyst alert sent."
             )
 
@@ -343,7 +343,7 @@ class AURAResponseEngine:
                 f.write(json.dumps(alert) + "\n")
         except Exception:
             pass
-        print(f"\n🚨 [HITL ALERT] Analyst action required on {node_id} ({node_label})\n")
+        print(f"\n[!] [HITL ALERT] Analyst action required on {node_id} ({node_label})\n")
 
     def _write_record(
         self, event, node_id, node_label, is_critical,
@@ -381,16 +381,16 @@ if __name__ == "__main__":
     eng = AURAResponseEngine()
 
     test_events = [
-        AnomalyEvent(time.time(), "test:w1", 0.10, 0.05, [], AlertSeverity.LOW,       [],     0.25, 0.0),
-        AnomalyEvent(time.time(), "test:w2", 0.55, 0.05, [], AlertSeverity.MEDIUM,    [5, 8], 0.65, 0.3),
-        AnomalyEvent(time.time(), "test:w3", 0.95, 0.05, [], AlertSeverity.HIGH,      [0],    0.92, 0.9),  # CRITICAL node
-        AnomalyEvent(time.time(), "test:w4", 0.95, 0.05, [], AlertSeverity.HIGH,      [12],   0.88, 0.9),  # Standard node
+        AnomalyEvent(time.time(), "test:w1", 0.10, 0.05, [], AlertSeverity.LOW,       [],     0.25, 0.0, [], "Normal", 0.0, {}),
+        AnomalyEvent(time.time(), "test:w2", 0.55, 0.05, [], AlertSeverity.MEDIUM,    [5, 8], 0.65, 0.3, [], "Normal", 0.0, {}),
+        AnomalyEvent(time.time(), "test:w3", 0.95, 0.05, [], AlertSeverity.HIGH,      [0],    0.92, 0.9, [], "Normal", 0.0, {}),  # CRITICAL node
+        AnomalyEvent(time.time(), "test:w4", 0.95, 0.05, [], AlertSeverity.HIGH,      [12],   0.88, 0.9, [], "Normal", 0.0, {}),  # Standard node
     ]
 
     for ev in test_events:
         print(f"\n--- Processing {ev.severity.name} event (nodes={ev.triggered_nodes}) ---")
         records = eng.act(ev)
         for r in records:
-            print(f"  → {r.action_taken:20s} | critical={r.is_critical} | {r.policy_reason[:60]}…")
+            print(f"  -> {r.action_taken:20s} | critical={r.is_critical} | {r.policy_reason[:60]}...")
 
-    print("\n✓ Response engine test passed.")
+    print("\n[PASS] Response engine test passed.")

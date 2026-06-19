@@ -261,23 +261,26 @@ class AURAFlowerClient(fl.client.Client):
         client_id:    str,
         train_data:   torch.Tensor,
         val_data:     torch.Tensor,
-        local_epochs: int   = 3,
-        device:       str   = "cpu",
+        local_epochs: int   = cfg.FL_LOCAL_EPOCHS,
+        device:       str   = None,
     ):
         self.client_id    = client_id
-        self.train_data   = train_data.to(device)
-        self.val_data     = val_data.to(device)
         self.local_epochs = local_epochs
-        self.device       = device
+        self.device       = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.train_data   = train_data.to(self.device)
+        self.val_data     = val_data.to(self.device)
 
         # Local model — each org starts with a fresh copy; federation aligns them
-        self.model    = AURAModelBundle().to(device)
+        self.model    = AURAModelBundle().to(self.device)
         self.optimizer = torch.optim.Adam(
             self.model.autoencoder.parameters(),
             lr=cfg.AE_LEARNING_RATE,
         )
-        logger.info(f"[{client_id}] Flower client initialised  |  "
-                    f"train={len(train_data)}  val={len(val_data)}  epochs={local_epochs}")
+        logger.info(
+            f"[{client_id}] Flower client initialised  |  "
+            f"train={len(train_data)}  val={len(val_data)}  "
+            f"epochs={local_epochs}  device={self.device}"
+        )
 
     # ------------------------------------------------------------------
     # Flower Protocol Methods
@@ -302,6 +305,7 @@ class AURAFlowerClient(fl.client.Client):
         Step 5: Return updated parameters + training metadata
         """
         logger.info(f"[{self.client_id}] Round started — loading global weights …")
+        self.local_epochs = int(ins.config.get("local_epochs", self.local_epochs))
 
         # Step 1: Deserialize global model parameters
         global_arrays = parameters_to_ndarrays(ins.parameters)
@@ -329,8 +333,11 @@ class AURAFlowerClient(fl.client.Client):
 
         # Step 5: Return updated weights
         updated_arrays = model_to_ndarrays(self.model)
-        logger.info(f"[{self.client_id}] Round complete  |  "
-                    f"loss={train_loss:.4f}  examples={num_examples}")
+        logger.info(
+            f"[{self.client_id}] Round complete  |  "
+            f"loss={train_loss:.4f}  examples={num_examples}  "
+            f"epochs={self.local_epochs}"
+        )
 
         return FitRes(
             status     = Status(code=Code.OK, message="OK"),
@@ -488,15 +495,17 @@ def create_mock_clients(
             # Strong poisoning: 80% of samples with extreme values across ALL
             # feature groups — ensures weight update is a clear FLTrust outlier
             # rather than noise-level drift that gets masked by random init variance.
-            n_attack = int(n_samples * 0.8)
+            n_attack = int(len(train_data) * 0.8)
             attack_rows = torch.rand(n_attack, feature_dim)
-            # Spike all major feature blocks to max range
-            attack_rows[:, :20]  = torch.rand(n_attack, 20) * 0.5 + 0.5   # flow stats
-            attack_rows[:, 20:40] = torch.rand(n_attack, 20) * 0.4 + 0.6  # packet stats
-            attack_rows[:, 40:60] = torch.rand(n_attack, 20) * 0.6 + 0.4  # flag counts
-            attack_rows[:, 60:]  = torch.rand(n_attack, feature_dim - 60) * 0.9 + 0.1
+            # Spike all major feature blocks to max range (47 NF-UNSW features)
+            attack_rows[:, :16]  = torch.rand(n_attack, 16) * 0.5 + 0.5   # proto/volume/flags
+            attack_rows[:, 16:32] = torch.rand(n_attack, 16) * 0.4 + 0.6  # pkt size/throughput
+            attack_rows[:, 32:]  = torch.rand(n_attack, feature_dim - 32) * 0.6 + 0.4  # IAT/app
             train_data[:n_attack] = attack_rows
-            logger.info(f"[{client_id}] Strong attack injection: {n_attack}/{n_samples} samples poisoned.")
+            logger.info(
+                f"[{client_id}] Strong attack injection: "
+                f"{n_attack}/{len(train_data)} samples poisoned."
+            )
 
         clients.append(AURAFlowerClient(client_id, train_data, val_data))
 
@@ -540,11 +549,10 @@ def start_client(
         # Adversarial client: poisoned data with extreme feature values
         n_attack = n_samples // 5
         attack_rows = torch.rand(n_attack, feature_dim)
-        attack_rows[:, [2, 3, 15]] = torch.rand(n_attack, 3) * 0.3 + 0.7
-        attack_rows[:, [4, 5, 63]] = torch.rand(n_attack, 3) * 0.2 + 0.8
+        attack_rows[:, [2, 3, 6]] = torch.rand(n_attack, 3) * 0.3 + 0.7   # in_bytes, in_pkts, tcp_flags
+        attack_rows[:, [4, 5, 9]] = torch.rand(n_attack, 3) * 0.2 + 0.8   # out_bytes, out_pkts, flow_dur
         train_data[:n_attack] = attack_rows
         logger.info(f"[{client_id}] Byzantine mode — poisoned data injected.")
-
     client = AURAFlowerClient(client_id, train_data, val_data)
 
     print(f"\n[{client_id}] Connecting to FL server at {server_address} …")

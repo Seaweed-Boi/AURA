@@ -114,7 +114,7 @@ def _hitl_gate(node_id: str, node_label: str, confidence: float) -> bool:
     the system degrades gracefully — a node is never left uncontrolled.
     """
     print("\n" + "=" * 62)
-    print("  ⚠  AURA — HUMAN-IN-THE-LOOP ISOLATION APPROVAL REQUIRED")
+    print("  [!]  AURA - HUMAN-IN-THE-LOOP ISOLATION APPROVAL REQUIRED")
     print("=" * 62)
     print(f"  Node     : {node_id} ({node_label})")
     print(f"  Confidence: {confidence:.2%}")

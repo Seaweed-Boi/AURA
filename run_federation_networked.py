@@ -57,6 +57,7 @@ import subprocess
 import sys
 import time
 import os
+import random
 from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -77,7 +78,7 @@ ORGS = [
     {
         "client_id":    "org_bank_2",
         "network_sim":  "10.0.1.0/24",
-        "byzantine":    True,
+        "byzantine":    False,
         "samples":      500,
         "description":  "Bank Network — ADVERSARIAL (Byzantine poisoning attempt)",
     },
@@ -176,7 +177,15 @@ def stream_output(proc: subprocess.Popen, label: str) -> None:
 
 
 def run(server_address: str, rounds: int, server_only: bool) -> None:
+    # Randomly assign the Byzantine role to exactly one organization
+    for org in ORGS:
+        org["byzantine"] = False
+
+    attacker = random.choice(ORGS)
+    attacker["byzantine"] = True
+
     print_banner(server_address)
+    print(f"[LAUNCHER] 🎲 Randomly selected Byzantine client for this session: {attacker['client_id']}\n")
 
     # ── 1. Start server ──────────────────────────────────────────────────────
     server_proc = start_server_process(server_address, rounds)
@@ -235,13 +244,6 @@ def run(server_address: str, rounds: int, server_only: bool) -> None:
 
 # ── Server __main__ support (fl_server.py needs CLI args) ────────────────────
 
-def _patch_server_cli():
-    """Add CLI argument parsing to fl_server.py's __main__ block."""
-    # We launch fl_server.py directly; it needs to accept --address / --rounds.
-    # This is handled inside fl_server.py's __main__ block below.
-    pass
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AURA Networked FL Launcher")
     parser.add_argument(
@@ -254,9 +256,4 @@ if __name__ == "__main__":
                         help="Start server and wait for remote clients (no local client procs)")
     args = parser.parse_args()
 
-    run(
-        server_address = args.server_address,
-        rounds         = args.rounds,
-        server_only    = args.server_only,
-    )
-
+    run(args.server_address, args.rounds, args.server_only)

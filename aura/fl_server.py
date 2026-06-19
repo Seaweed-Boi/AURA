@@ -57,6 +57,7 @@ import io
 import json
 import logging
 import time
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -188,7 +189,7 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
 
     Shape: [n_samples, FEATURE_DIM]  on CPU.
     """
-    # Normal traffic clusters around 0.35–0.5 in MinMax-normalised CICIDS space
+    # Normal traffic clusters around 0.35–0.5 in MinMax-normalised NF-UNSW space
     data = torch.rand(n_samples, cfg.FEATURE_DIM) * 0.15 + 0.35
     return data
 
@@ -371,7 +372,7 @@ class KrumFedAURA(FedAvg):
             min_available_clients = min_available_clients,
             # Round config function: tells clients how many local epochs to run
             on_fit_config_fn = lambda rnd: {
-                "local_epochs": 3,
+                "local_epochs": cfg.FL_LOCAL_EPOCHS,
                 "round":        rnd,
                 # Hint to client libraries; actual enforcement is server-side
                 "timeout_sec":  round_timeout_sec,
@@ -641,7 +642,7 @@ def start_server(blockchain_module=None) -> None:
     print(f"\n{'='*60}")
     print(f"  AURA Federation Server starting on {cfg.FL_SERVER_ADDRESS}")
     print(f"  Rounds: {cfg.FL_NUM_ROUNDS}  |  Timeout: {cfg.FL_ROUND_TIMEOUT_SEC}s")
-    print(f"  Strategy: Krum (Byzantine-robust, selects {cfg.KRUM_NUM_TO_SELECT})")
+    print(f"  Strategy: FLTrust (5-client Byzantine-robust aggregation)")
     print(f"{'='*60}\n")
 
     fl.server.start_server(
@@ -676,10 +677,11 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
 
     # Attack is tied to the bank org — only injected if bank is in active_orgs.
     # If bank is offline, all clients are honest (no meaningless FLTrust flag).
-    if "bank" in active_orgs:
-        attack_arg = active_orgs.index("bank")
+    if active_orgs:
+        attack_arg = random.randint(0, len(active_orgs) - 1)
+        print(f"[SERVER] 🎲 Randomly selected Byzantine client index: {attack_arg} ({active_orgs[attack_arg]})")
     else:
-        attack_arg = -1   # all honest
+        attack_arg = -1
 
     from aura.data_loader import CICIDSDataLoader
     _shared_loader = CICIDSDataLoader()
@@ -712,7 +714,7 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
             from flwr.common import FitIns, Config
             fit_ins = FitIns(
                 parameters = ndarrays_to_parameters(global_params),
-                config     = {"local_epochs": 3, "round": rnd},
+                config     = {"local_epochs": cfg.FL_LOCAL_EPOCHS, "round": rnd},
             )
             fit_res = client.fit(fit_ins)
 
@@ -736,8 +738,10 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
             is_byzantine = (i in dropped_idx)   # FLTrust-flagged = suspicious
             org_key      = active_orgs[i] if i < len(active_orgs) else f"org_{i}"
             net_map      = {"hospital": "192.168.1.0/24",
-                            "bank":     "10.0.1.0/24",
-                            "university": "172.16.1.0/24"}
+                            "bank": "10.0.1.0/24",
+                            "university": "172.16.1.0/24",
+                            "isp": "10.10.0.0/24",
+                            "retail": "172.31.0.0/24"}
             client_statuses.append({
                 "client_id": client.client_id,
                 "org_id":    org_key,
@@ -840,7 +844,7 @@ if __name__ == "__main__":
         print(f"  AURA Federation Server — NETWORKED MODE")
         print(f"  Binding on:  {args.address}")
         print(f"  Rounds:      {args.rounds}")
-        print(f"  Strategy:    Krum (Byzantine-robust, select {cfg.KRUM_NUM_TO_SELECT})")
+        print(f"  Strategy:    FLTrust (5-client Byzantine-robust aggregation)")
         print(f"  Waiting for {cfg.FL_MIN_AVAILABLE} clients to connect …")
         print(f"{'='*62}\n")
 

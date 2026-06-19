@@ -1,0 +1,30 @@
+export const THEME = {
+  bg: '#0a0e1a',
+  panel: '#0f1629',
+  border: '#1e2d4a',
+  text: '#e0e8f0',
+  green: '#00ff88',
+  yellow: '#ffd700',
+  red: '#ff4444',
+  blue: '#4488ff',
+  cyan: '#00ccff',
+  orange: '#ff8800',
+  dim: '#445566',
+  amber: '#f59e0b',
+} as const
+
+export const FL_THEME = {
+  bg: '#0d1117',
+  panel: '#161b22',
+  panel2: '#1c2430',
+  border: '#30363d',
+  cyan: '#58d1e8',
+  green: '#3fb950',
+  red: '#f85149',
+  orange: '#d29922',
+  blue: '#388bfd',
+  purple: '#bc8cff',
+  yellow: '#e3b341',
+  dim: '#8b949e',
+  text: '#c9d1d9',
+} as const

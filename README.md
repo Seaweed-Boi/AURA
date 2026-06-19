@@ -19,7 +19,7 @@ AURA is a production-grade, privacy-preserving network intrusion detection syste
 - **Reconstruction Error Explainability** — per-feature AE attribution + attack signature matching via cosine similarity, producing human-readable SOC operator explanations
 - **YAML-Driven Response Engine** — operator-configurable scripts (LOG → THROTTLE → ISOLATE) loaded from `response_policy.yaml` with Human-in-the-Loop (HITL) gates for isolation actions
 - **3-Tier Automated Response** — LOG → THROTTLE → ISOLATE based on severity and node criticality
-- **Dual Streamlit Dashboards** — live anomaly detection dashboard + dedicated FL Server Console with step-by-step pipeline animation
+- **React + Vite Dashboards** — live anomaly detection dashboard + dedicated FL Server Console (replaces Streamlit for performance)
 
 ---
 
@@ -97,9 +97,10 @@ TRINETRA/
 │   ├── isolate.sh               # Network isolation script (iptables DROP)
 │   ├── throttle.sh              # Bandwidth throttle script (tc qdisc)
 │   └── log_only.sh              # Passive logging script
-├── dashboard.py                 # Streamlit live anomaly detection dashboard
-├── fl_server_dashboard.py       # Streamlit FL Server Console (pipeline animation)
-├── api_server.py                # Flask Custom Script Injection API (port 5001)
+├── frontend/                    # React + Vite UI (Operations + FL Server Console)
+├── dashboard.py                 # [Legacy] Streamlit dashboard — use frontend/ instead
+├── fl_server_dashboard.py       # [Legacy] Streamlit FL console — use frontend/ instead
+├── api_server.py                # Flask REST API backend (port 5001)
 ├── policy_engine.py             # YAML-driven response script execution engine (Upgrade 1)
 ├── response_policy.yaml         # Operator-configurable response rules
 ├── train.py                     # Two-phase training pipeline
@@ -165,26 +166,36 @@ python calibrate_thresholds.py --train-quick  # trains a fresh AE quickly then c
 python calibrate_thresholds.py --audit-only   # only audits FEATURE_INDEX_MAP vs CSV
 ```
 
-### 5. Launch the anomaly detection dashboard
+### 5. Launch the dashboard (React + Vite)
+
+**Prerequisites:** Node.js 18+ and npm.
 
 ```bash
 python run.py dashboard
-# Open http://localhost:8501
+# API:  http://localhost:5001
+# UI:   http://localhost:5173  (opens automatically)
 ```
 
-### 6. Launch the FL Server Console (separate terminal)
+**Manual start (two terminals):**
 
 ```bash
-streamlit run fl_server_dashboard.py
-# Open http://localhost:8502
-```
-
-### 7. Start the Custom Injection API Server (separate terminal)
-
-```bash
+# Terminal 1 — API backend
 python api_server.py
-# API running on http://localhost:5001
-# Endpoints: GET /api/nodes  |  POST /api/inject_custom
+
+# Terminal 2 — React UI
+cd frontend && npm install && npm run dev
+# Open http://localhost:5173
+```
+
+The UI includes both **Operations Dashboard** (`/`) and **FL Server Console** (`/fl-server`) via sidebar navigation.
+
+### 6. [Legacy] Streamlit dashboards
+
+Streamlit UIs are retained for reference but are no longer recommended (laggy). Use the React frontend instead.
+
+```bash
+streamlit run dashboard.py          # port 8501
+streamlit run fl_server_dashboard.py  # port 8502
 ```
 
 ### 8. Run sanity tests

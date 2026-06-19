@@ -312,7 +312,7 @@ class AURAInferenceEngine:
 
         Parameters
         ----------
-        graph  : dict from CICIDSDataLoader.stream_graphs()
+        graph  : dict from CICIDSDataLoader.stream_graphs() (NF-UNSW-NB15-v3)
         labels : optional ground-truth label tensor [E] for eval metrics
 
         Returns
@@ -588,4 +588,4 @@ if __name__ == "__main__":
                   f"conf={event.confidence:.2%}")
 
     print("\nEMA state:", eng.ema_state)
-    print("✓ Detector test passed.")
+    print("[PASS] Detector test passed.")

@@ -1,7 +1,12 @@
 """
-dashboard.py — AURA Live Operations Dashboard
-==============================================
-Run with:  streamlit run dashboard.py
+dashboard.py — [LEGACY] AURA Live Operations Dashboard (Streamlit)
+================================================================
+DEPRECATED: Use the React+Vite frontend instead (faster, no lag).
+
+  python run.py dashboard     # starts api_server + React UI
+  cd frontend && npm run dev  # UI only (http://localhost:5173)
+
+This Streamlit version is kept for reference only.
 
 The AURA dashboard is the "nerve centre" of the hackathon demo.
 

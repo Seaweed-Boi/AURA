@@ -28,14 +28,57 @@ def cmd_train(quick=False):
 
 
 def cmd_dashboard():
-    print("\n🛡️  Launching AURA Dashboard …")
-    print("   Open http://localhost:8501 in your browser.\n")
-    subprocess.run([
-        PYTHON, "-m", "streamlit", "run",
-        str(BASE / "dashboard.py"),
-        "--server.headless", "false",
-        "--theme.base", "dark",
-    ])
+    """Launch React+Vite UI with Flask API backend (replaces Streamlit)."""
+    import webbrowser
+    import time as _time
+
+    frontend = BASE / "frontend"
+    if not (frontend / "package.json").exists():
+        print("Frontend not found. Expected:", frontend)
+        sys.exit(1)
+
+    # Free port 5001 if a stale API server is still running (Windows)
+    if sys.platform == "win32":
+        subprocess.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "Get-NetTCPConnection -LocalPort 5001 -ErrorAction SilentlyContinue | "
+                "ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }",
+            ],
+            capture_output=True,
+        )
+
+    print("\n[!] Launching AURA Dashboard (React + Vite) ...")
+    print("   API:  http://localhost:5001")
+    print("   UI:   http://localhost:5173\n")
+
+    api_proc = subprocess.Popen(
+        [PYTHON, str(BASE / "api_server.py")],
+        cwd=str(BASE),
+    )
+
+    # Install deps on first run if node_modules missing
+    if not (frontend / "node_modules").exists():
+        print("Installing frontend dependencies (first run)…")
+        subprocess.run(["npm", "install"], cwd=str(frontend), shell=True, check=True)
+
+    ui_proc = subprocess.Popen(
+        ["npm", "run", "dev"],
+        cwd=str(frontend),
+        shell=True,
+    )
+
+    _time.sleep(2)
+    webbrowser.open("http://localhost:5173")
+
+    try:
+        ui_proc.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        api_proc.terminate()
+        ui_proc.terminate()
+        print("\nDashboard stopped.\n")
 
 
 def cmd_test():
@@ -54,8 +97,11 @@ def cmd_test():
     ]
 
     for name, script in tests:
-        result = subprocess.run([PYTHON, str(script)], capture_output=True, text=True)
-        status = "✓ PASS" if result.returncode == 0 else "✗ FAIL"
+        args = [PYTHON, str(script)]
+        if name == "FL Client":
+            args.append("--help")
+        result = subprocess.run(args, capture_output=True, text=True)
+        status = "[PASS]" if result.returncode == 0 else "[FAIL]"
         color  = "\033[92m" if result.returncode == 0 else "\033[91m"
         print(f"  {color}{status}\033[0m  {name}")
         if result.returncode != 0:

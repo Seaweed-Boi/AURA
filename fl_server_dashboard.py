@@ -3,7 +3,7 @@ fl_server_dashboard.py — AURA Federated Learning Server Dashboard
 ==================================================================
 
 Dedicated server-side console showing:
-  • All three org clients (Hospital / Bank / University)
+  • All five org clients (Hospital / Bank / University / ISP / Retail)
   • Step-by-step FL pipeline animation (collect → FLTrust → aggregate → mint → broadcast)
   • Blockchain hash minting live feed
   • Per-round history table with FLTrust trust scores
@@ -158,14 +158,20 @@ _ORGS = [
     {"id": "org_hospital_1",    "label": "Hospital",    "net": "192.168.1.0/24",  "role": "Normal"},
     {"id": "org_bank_2",        "label": "Bank",        "net": "10.0.1.0/24",     "role": "Normal"},
     {"id": "org_university_3",  "label": "University",  "net": "172.16.1.0/24",   "role": "Normal"},
+    {"id": "org_isp_4",         "label": "ISP",         "net": "10.10.0.0/24",    "role": "Normal"},
+    {"id": "org_retail_5",      "label": "Retail",      "net": "172.31.0.0/24",   "role": "Normal"},
 ]
+_ORG_KEYS = ["hospital", "bank", "university", "isp", "retail"]
 
 # Canonical mapping: org id → short key (used everywhere for active_orgs checks)
 _ORG_ID_TO_KEY = {
     "org_hospital_1":   "hospital",
     "org_bank_2":       "bank",
     "org_university_3": "university",
+    "org_isp_4":        "isp",
+    "org_retail_5":     "retail",
 }
+_ORG_KEY_TO_ID = {v: k for k, v in _ORG_ID_TO_KEY.items()}
 
 _PIPE_STEPS = [
     ("📥", "Collect\nWeights"),
@@ -231,7 +237,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
     # ── Determine active orgs from shared readiness file ────────────────────────
     readiness = _read_readiness()
-    all_org_keys = ["hospital", "bank", "university"]
+    all_org_keys = _ORG_KEYS
     # Exclude orgs that are: (a) not ready, OR (b) currently under active attack.
     # Under-attack orgs are quarantined — they must NOT contribute weights to FL
     # because their data is compromised. They are blocked before FL starts, not
@@ -241,10 +247,10 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     active_orgs = [k for k in all_org_keys
                    if readiness.get(k, {}).get("ready", False)
                    and k not in quarantined]
-    # Fall back to all 3 if no readiness data exists (demo mode)
+    # Fall back to all 5 if no readiness data exists (demo mode)
     if not active_orgs and not quarantined:
         active_orgs = all_org_keys
-        _log("No readiness data found — using all 3 orgs (demo mode)")
+        _log("No readiness data found — using all 5 orgs (demo mode)")
     else:
         inactive = [k for k in all_org_keys if k not in active_orgs and k not in quarantined]
         if quarantined:
@@ -279,7 +285,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
     # Mark quarantined org cards immediately so they show as blocked
     for _qk in quarantined:
-        _qid = {"hospital": "org_hospital_1", "bank": "org_bank_2", "university": "org_university_3"}[_qk]
+        _qid = _ORG_KEY_TO_ID[_qk]
         st.session_state["client_cards"][_qid]["status"] = "quarantined"
 
     # All orgs participate honestly by default — no attack injected.
@@ -300,7 +306,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
     _log("\u2705 All active orgs sending honest data this run")
 
     # Pass the live client count so aggregate_fit's quorum check never
-    # abandons rounds when fewer than 3 orgs are active (e.g. one quarantined).
+    # abandons rounds when fewer than 5 orgs are active (e.g. one quarantined).
     n_active = len(active_orgs)
     strategy = KrumFedAURA(
         blockchain_module      = bc_module,
@@ -336,7 +342,7 @@ def run_fl_with_animation(pipe_ph, card_placeholders, log_ph, ledger_ph,
 
             fit_ins = FitIns(
                 parameters = ndarrays_to_parameters(global_params),
-                config     = {"local_epochs": 3, "round": rnd},
+                config     = {"local_epochs": cfg.FL_LOCAL_EPOCHS, "round": rnd},
             )
             fit_res = client.fit(fit_ins)
             fit_results.append((None, fit_res))
