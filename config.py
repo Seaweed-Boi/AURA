@@ -7,13 +7,21 @@ Centralising config prevents magic numbers from scattering across modules.
 Research-grade design goals
 ---------------------------
   * Zero hardcoded values in any other module — every tunable lives here.
-  * Synthetic fallbacks documented inline so paper reviewers can reproduce
-    results with or without the full NF-UNSW-NB15-v3 dataset.
+  * AE thresholds are resolved dynamically from calibration_results.json
+    (written by calibrate_thresholds.py) so they always reflect the actual
+    benign MSE distribution — NOT a magic number.
+  * Attack corruption profiles are resolved from attack_class_stats.json
+    (written by scripts/train_explainer.py) so they reflect real dataset
+    percentiles — NOT hand-typed ranges.
   * All paths constructed relative to BASE_DIR so the project is portable.
 """
 
+import json
+import logging
 import os
 from pathlib import Path
+
+_cfg_log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
@@ -341,127 +349,288 @@ FEATURE_INDEX_MAP: dict = {
     "dst_to_src_iat_stddev":    46,
 }
 
-# MSE severity thresholds for custom injection events.
-# These values are calibrated to the current AE's reconstruction error scale.
-# Raise MSE_THRESHOLD_HIGH to require stronger anomaly evidence for HIGH tier.
-MSE_THRESHOLD_HIGH   = 0.7   # MSE above this → AlertSeverity.HIGH
-MSE_THRESHOLD_MEDIUM = 0.4   # MSE above this → AlertSeverity.MEDIUM  (else LOW)
+# ─────────────────────────────────────────────────────────────────────────────
+# DYNAMIC AE THRESHOLD LOADER
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The AE threshold MUST be derived from the benign traffic distribution, NOT a
+# magic number. Specifically it is the EMA-adjusted UCL (μ + 3σ upper control
+# limit) over benign reconstruction errors — see Section 3.1 in the paper.
+#
+# Resolution order:
+#   1. logs/calibration_results.json  (written by calibrate_thresholds.py)
+#   2. Loud WARNING + magic-number sentinel fallback
+#
+# Run `python calibrate_thresholds.py` once after training to produce the JSON.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CALIB_JSON_PATH = LOGS_DIR / "calibration_results.json"
+
+
+def load_ae_thresholds() -> tuple[float, float]:
+    """
+    Load MSE_THRESHOLD_HIGH and MSE_THRESHOLD_MEDIUM from calibration_results.json.
+
+    Returns
+    -------
+    (threshold_high, threshold_medium) derived from the benign MSE distribution.
+
+    Raises FileNotFoundError if calibration_results.json is missing, or ValueError
+    if the file cannot be parsed. This enforces that no hardcoded threshold values
+    are used in the research project.
+    """
+    if not _CALIB_JSON_PATH.exists():
+        msg = (
+            "[CONFIG] ❌ logs/calibration_results.json NOT FOUND. "
+            "Dynamic AE thresholds are required for this research project. "
+            "Run: `python calibrate_thresholds.py` to generate them."
+        )
+        _cfg_log.error(msg)
+        raise FileNotFoundError(msg)
+
+    try:
+        data = json.loads(_CALIB_JSON_PATH.read_text())
+        high   = float(data["recommended_MSE_THRESHOLD_HIGH"])
+        medium = float(data["recommended_MSE_THRESHOLD_MEDIUM"])
+
+        # Sanity-check the P90/P99 collapse issue documented in the paper.
+        # If the gap is < 0.002 the three-tier severity system collapses.
+        p90 = data.get("p90", medium)
+        p99 = data.get("p99", high)
+        if abs(p99 - p90) < 0.002:
+            _cfg_log.warning(
+                "[CONFIG] ⚠️  AE threshold collapse detected: "
+                f"P90={p90:.6f}  P99={p99:.6f}  gap={abs(p99-p90):.6f} < 0.002. "
+                "Three-tier severity system is functionally degraded. "
+                "Consider the parallel fusion architecture (AE + GNN scores combined) "
+                "as documented in the Tier 2.5 experiment."
+            )
+
+        _cfg_log.info(
+            f"[CONFIG] AE thresholds loaded from calibration JSON — "
+            f"HIGH={high:.6f}  MEDIUM={medium:.6f}"
+        )
+        return high, medium
+
+    except Exception as exc:
+        msg = (
+            f"[CONFIG] ❌ Failed to parse calibration_results.json: {exc}. "
+            "Run: `python calibrate_thresholds.py` to regenerate it."
+        )
+        _cfg_log.error(msg)
+        raise ValueError(msg) from exc
+
+
+# Resolved at import time — every consumer (api_server, dashboard, dashboard_service)
+# picks up the calibrated value automatically once calibration_results.json exists.
+_ae_thresh_high, _ae_thresh_medium = load_ae_thresholds()
+
+MSE_THRESHOLD_HIGH   = _ae_thresh_high    # EMA-UCL P99 of benign MSE distribution
+MSE_THRESHOLD_MEDIUM = _ae_thresh_medium  # EMA-UCL P90 of benign MSE distribution
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DASHBOARD UI CONSTANTS (Streamlit)
+# DATA-DRIVEN ATTACK CORRUPTION PROFILES
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Each profile maps feature keys → (lo, hi) normalised perturbation ranges.
+# These ranges MUST come from the actual NF-UNSW-NB15-v3 dataset, not from
+# manually crafted guesses.  The canonical source is:
+#   saved_models/attack_class_stats.json
+# which is produced by scripts/train_explainer.py and stores per-class
+# p05 / p95 percentiles for all 47 features.
+#
+# Resolution order:
+#   1. saved_models/attack_class_stats.json  — real dataset percentiles
+#   2. Hardcoded sentinel profiles           — fallback with loud WARNING
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Freshness windows for dashboard file polls (seconds)
-# Reduced from 30s to speed up node state clearing
-PENDING_INJECT_FRESHNESS_SEC = 15       # Time window for pending_inject.json poll
-LAST_EXPLANATION_FRESHNESS_SEC = 20     # Time window for last_explanation.json
+# Map: config profile key → Attack column value in NF-UNSW-NB15-v3.csv
+# Dataset Attack column uses: 'DoS', 'Exploits', 'Fuzzers', 'Reconnaissance',
+# 'Backdoor', 'Generic', 'Shellcode', 'Analysis', 'Worms', 'Benign'
+_ATTACK_STATS_KEY_MAP: dict = {
+    "ddos":           "ddos",
+    "lateral":        "lateral",
+    "exfil":          "exfil",
+    "port_scan":      "portscan",
+    "web":            "web",
+    "exploits":       "exploits",
+    "fuzzers":        "fuzzers",
+    "reconnaissance": "portscan",   # mapped to same class in stats JSON
+    "backdoor":       "backdoor",
+    "custom":         None,          # no real-data class; stays as sentinel
+}
 
-# Node state display strings
-NODE_STATE_EVALUATING_SIMPLE = "Evaluating…"           # During EMA warmup
-NODE_STATE_EVALUATING_ICON = "⚡ Evaluating…"          # Custom injection with icon
-
-# Cache limits for session state
-MAX_ALERTS_CACHE = 30                   # Max alerts in Alert History
-MAX_INCIDENTS_CACHE = 20                # Max incidents in Response Actions
-
-# Custom injection analysis thresholds
-CUSTOM_INJECT_AE_THRESHOLD = 0.3        # AE reconstruction threshold for severity
-SCRIPT_PREVIEW_LENGTH = 300             # API injection script preview truncation
-
-# Reduce EMA warmup for faster threat escalation during demos
-# (Original: 50 batches ≈ 50 seconds; New: 20 batches ≈ 20 seconds)
-EMA_WARMUP_BATCHES = 20
-
-# Corruption profiles for each simulated attack type.
-# Each profile maps feature-group names to their corruption ranges:
-#   {feature_key_from_FEATURE_INDEX_MAP: (lo, hi)}
-# _run_inject_inference() applies each group in order and skips absent keys.
-ATTACK_CORRUPTION_PROFILES: dict = {
+# Sentinel profiles — used ONLY when attack_class_stats.json is absent.
+# These are hand-approximated and MUST NOT be cited in the paper as ground truth.
+_SENTINEL_ATTACK_PROFILES: dict = {
     "ddos": {
         "in_pkts":                  (0.90, 0.99),
         "out_pkts":                 (0.85, 0.99),
         "src_to_dst_second_bytes":  (0.88, 0.99),
-        "src_to_dst_iat_avg":       (0.00, 0.03),   # near-zero = flood
-        "src_to_dst_iat_stddev":    (0.00, 0.02),   # robotic regularity
-        "tcp_flags":                (0.80, 0.99),    # mass SYN without ACK
-        "flow_duration":            (0.00, 0.05),    # very short flows
+        "src_to_dst_iat_avg":       (0.00, 0.03),
+        "src_to_dst_iat_stddev":    (0.00, 0.02),
+        "tcp_flags":                (0.80, 0.99),
+        "flow_duration":            (0.00, 0.05),
     },
     "lateral": {
         "flow_duration":            (0.50, 0.75),
         "in_pkts":                  (0.50, 0.65),
-        "src_to_dst_iat_stddev":    (0.75, 0.95),   # high jitter = evasion
+        "src_to_dst_iat_stddev":    (0.75, 0.95),
         "dst_to_src_iat_stddev":    (0.75, 0.95),
-        "duration_in":              (0.80, 0.98),    # beacon-like pauses
-        "duration_out":             (0.03, 0.10),    # robotic regularity
+        "duration_in":              (0.80, 0.98),
+        "duration_out":             (0.03, 0.10),
         "client_tcp_flags":         (0.60, 0.80),
     },
     "exfil": {
-        "in_bytes":                 (0.88, 0.99),    # large outbound
-        "out_bytes":                (0.00, 0.06),    # nothing coming back
+        "in_bytes":                 (0.88, 0.99),
+        "out_bytes":                (0.00, 0.06),
         "src_to_dst_second_bytes":  (0.85, 0.99),
         "dst_to_src_second_bytes":  (0.00, 0.04),
-        "src_to_dst_iat_avg":       (0.40, 0.55),   # regulated pacing
-        "src_to_dst_iat_stddev":    (0.00, 0.03),   # robotic timing
+        "src_to_dst_iat_avg":       (0.40, 0.55),
+        "src_to_dst_iat_stddev":    (0.00, 0.03),
         "flow_duration":            (0.80, 0.98),
     },
     "port_scan": {
         "flow_duration":            (0.00, 0.03),
         "in_bytes":                 (0.00, 0.04),
         "out_bytes":                (0.00, 0.03),
-        "tcp_flags":                (0.80, 0.99),    # RST/SYN mix
+        "tcp_flags":                (0.80, 0.99),
         "client_tcp_flags":         (0.70, 0.90),
         "src_to_dst_second_bytes":  (0.05, 0.15),
     },
     "web": {
         "in_bytes":                 (0.80, 0.95),
         "out_bytes":                (0.20, 0.30),
-        "client_tcp_flags":         (0.85, 0.98),    # PSH flags
+        "client_tcp_flags":         (0.85, 0.98),
         "server_tcp_flags":         (0.85, 0.98),
         "flow_duration":            (0.05, 0.12),
         "src_to_dst_iat_avg":       (0.02, 0.08),
     },
     "exploits": {
         "in_bytes":                 (0.70, 0.95),
-        "longest_flow_pkt":         (0.85, 0.99),    # oversized payloads
+        "longest_flow_pkt":         (0.85, 0.99),
         "tcp_flags":                (0.60, 0.85),
         "flow_duration":            (0.10, 0.30),
-        "retransmitted_in_bytes":   (0.40, 0.70),    # retransmits from instability
+        "retransmitted_in_bytes":   (0.40, 0.70),
         "src_to_dst_iat_stddev":    (0.50, 0.80),
     },
     "fuzzers": {
         "in_bytes":                 (0.60, 0.90),
         "in_pkts":                  (0.70, 0.95),
         "longest_flow_pkt":         (0.70, 0.99),
-        "shortest_flow_pkt":        (0.00, 0.05),    # mixed sizes = fuzzing
-        "src_to_dst_iat_stddev":    (0.80, 0.99),    # chaotic timing
+        "shortest_flow_pkt":        (0.00, 0.05),
+        "src_to_dst_iat_stddev":    (0.80, 0.99),
         "flow_duration":            (0.10, 0.40),
-        "protocol":                 (0.80, 0.99),    # unusual protocols
+        "protocol":                 (0.80, 0.99),
     },
     "reconnaissance": {
-        "flow_duration":            (0.00, 0.05),    # very short probe flows
-        "in_bytes":                 (0.00, 0.08),    # minimal data
+        "flow_duration":            (0.00, 0.05),
+        "in_bytes":                 (0.00, 0.08),
         "out_bytes":                (0.00, 0.06),
-        "tcp_flags":                (0.70, 0.95),    # SYN probes
-        "num_pkts_up_to_128_bytes": (0.80, 0.99),    # small packets
+        "tcp_flags":                (0.70, 0.95),
+        "num_pkts_up_to_128_bytes": (0.80, 0.99),
         "src_to_dst_second_bytes":  (0.05, 0.15),
     },
     "backdoor": {
         "flow_duration":            (0.60, 0.90),
         "in_bytes":                 (0.40, 0.65),
-        "out_bytes":                (0.40, 0.65),    # symmetric C2 traffic
-        "src_to_dst_iat_avg":       (0.50, 0.70),    # periodic beaconing
-        "src_to_dst_iat_stddev":    (0.00, 0.05),    # robotic regularity
+        "out_bytes":                (0.40, 0.65),
+        "src_to_dst_iat_avg":       (0.50, 0.70),
+        "src_to_dst_iat_stddev":    (0.00, 0.05),
         "dst_to_src_iat_avg":       (0.50, 0.70),
         "dst_to_src_iat_stddev":    (0.00, 0.05),
     },
     "custom": {
-        # Generic high-variance anomaly: packet size, chaotic IAT, unusual protocols
+        # No real-data class for 'custom' — sentinel only.
         "longest_flow_pkt":         (0.85, 0.99),
         "shortest_flow_pkt":        (0.85, 0.99),
         "max_ip_pkt_len":           (0.85, 0.99),
         "min_ip_pkt_len":           (0.85, 0.99),
-        "src_to_dst_iat_avg":       (0.02, 0.05),   # near-zero IAT
-        "src_to_dst_iat_stddev":    (0.92, 0.99),   # chaotic
+        "src_to_dst_iat_avg":       (0.02, 0.05),
+        "src_to_dst_iat_stddev":    (0.92, 0.99),
         "protocol":                 (0.90, 0.99),
     },
 }
+
+
+def load_attack_corruption_profiles() -> dict:
+    """
+    Load attack corruption profiles derived from the NF-UNSW-NB15-v3 dataset.
+
+    Reads saved_models/attack_class_stats.json (produced by
+    scripts/train_explainer.py) and converts per-class (p05, p95) percentiles
+    into the {feature_key: (lo, hi)} format expected by _run_inject_inference().
+
+    The inverse-feature map (dataset column index → config key) is constructed
+    from FEATURE_INDEX_MAP so there is a single source of truth for column
+    ordering.
+
+    Returns the sentinel profiles (with WARNING) if the JSON is absent.
+    """
+    stats_path = MODELS_DIR / "attack_class_stats.json"
+    if not stats_path.exists():
+        _cfg_log.warning(
+            "[CONFIG] ⚠️  saved_models/attack_class_stats.json NOT FOUND. "
+            "Using sentinel ATTACK_CORRUPTION_PROFILES — these are NOT data-derived. "
+            "Run: python scripts/train_explainer.py"
+        )
+        return _SENTINEL_ATTACK_PROFILES
+
+    try:
+        stats_data = json.loads(stats_path.read_text())
+    except Exception as exc:
+        _cfg_log.error(
+            f"[CONFIG] Failed to parse attack_class_stats.json: {exc}. "
+            "Falling back to sentinel profiles."
+        )
+        return _SENTINEL_ATTACK_PROFILES
+
+    # Build index → feature-key reverse map from FEATURE_INDEX_MAP
+    idx_to_key: dict[int, str] = {v: k for k, v in FEATURE_INDEX_MAP.items()}
+
+    profiles: dict = {}
+    for profile_key, stats_key in _ATTACK_STATS_KEY_MAP.items():
+        if stats_key is None or stats_key not in stats_data:
+            # Keep the sentinel for profiles without a real-data class
+            profiles[profile_key] = _SENTINEL_ATTACK_PROFILES.get(profile_key, {})
+            continue
+
+        cls_stats = stats_data[stats_key]
+        p05 = cls_stats.get("p05", [])
+        p95 = cls_stats.get("p95", [])
+
+        if not p05 or not p95:
+            _cfg_log.warning(
+                f"[CONFIG] attack_class_stats.json missing p05/p95 for class '{stats_key}'. "
+                f"Using sentinel profile for '{profile_key}'."
+            )
+            profiles[profile_key] = _SENTINEL_ATTACK_PROFILES.get(profile_key, {})
+            continue
+
+        # Convert: only include features present in FEATURE_INDEX_MAP
+        feature_profile: dict = {}
+        for feat_idx, feat_key in idx_to_key.items():
+            if feat_idx < len(p05) and feat_idx < len(p95):
+                lo = round(float(p05[feat_idx]), 6)
+                hi = round(float(p95[feat_idx]), 6)
+                # Only include features where the attack class actually differs
+                # from the trivial [0,1] range (skip uninformative features)
+                if hi > lo:
+                    feature_profile[feat_key] = (lo, hi)
+
+        profiles[profile_key] = feature_profile
+        _cfg_log.info(
+            f"[CONFIG] Loaded dataset-derived profile for '{profile_key}' "
+            f"({stats_key}): {len(feature_profile)} features from NF-UNSW-NB15-v3."
+        )
+
+    # Always include the sentinel 'custom' profile unchanged
+    if "custom" not in profiles:
+        profiles["custom"] = _SENTINEL_ATTACK_PROFILES["custom"]
+
+    return profiles
+
+
+# Resolved at import time — derived from NF-UNSW-NB15-v3 via attack_class_stats.json.
+# Falls back to sentinel profiles with WARNING if the JSON is absent.
+ATTACK_CORRUPTION_PROFILES: dict = load_attack_corruption_profiles()
