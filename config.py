@@ -365,8 +365,6 @@ FEATURE_INDEX_MAP: dict = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CALIB_JSON_PATH = LOGS_DIR / "calibration_results.json"
-_HARDCODED_HIGH_SENTINEL  = 0.7   # sentinel only — do NOT cite in paper
-_HARDCODED_MEDIUM_SENTINEL = 0.4  # sentinel only — do NOT cite in paper
 
 
 def load_ae_thresholds() -> tuple[float, float]:
@@ -377,50 +375,50 @@ def load_ae_thresholds() -> tuple[float, float]:
     -------
     (threshold_high, threshold_medium) derived from the benign MSE distribution.
 
-    Raises a loud WARNING (does NOT crash the import) if the file is missing so
-    the system stays operational but the log makes the problem impossible to miss.
-    The caller (this module) assigns the sentinel values in that case.
+    Raises FileNotFoundError if calibration_results.json is missing, or ValueError
+    if the file cannot be parsed. This enforces that no hardcoded threshold values
+    are used in the research project.
     """
-    if _CALIB_JSON_PATH.exists():
-        try:
-            data = json.loads(_CALIB_JSON_PATH.read_text())
-            high   = float(data["recommended_MSE_THRESHOLD_HIGH"])
-            medium = float(data["recommended_MSE_THRESHOLD_MEDIUM"])
-
-            # Sanity-check the P90/P99 collapse issue documented in the paper.
-            # If the gap is < 0.002 the three-tier severity system collapses.
-            p90 = data.get("p90", medium)
-            p99 = data.get("p99", high)
-            if abs(p99 - p90) < 0.002:
-                _cfg_log.warning(
-                    "[CONFIG] ⚠️  AE threshold collapse detected: "
-                    f"P90={p90:.6f}  P99={p99:.6f}  gap={abs(p99-p90):.6f} < 0.002. "
-                    "Three-tier severity system is functionally degraded. "
-                    "Consider the parallel fusion architecture (AE + GNN scores combined) "
-                    "as documented in the Tier 2.5 experiment."
-                )
-
-            _cfg_log.info(
-                f"[CONFIG] AE thresholds loaded from calibration JSON — "
-                f"HIGH={high:.6f}  MEDIUM={medium:.6f}"
-            )
-            return high, medium
-
-        except Exception as exc:
-            _cfg_log.error(
-                f"[CONFIG] Failed to parse calibration_results.json: {exc}. "
-                "Using sentinel values — run `python calibrate_thresholds.py`."
-            )
-    else:
-        _cfg_log.warning(
-            "[CONFIG] ⚠️  logs/calibration_results.json NOT FOUND. "
-            f"Using sentinel MSE_THRESHOLD_HIGH={_HARDCODED_HIGH_SENTINEL} "
-            f"and MSE_THRESHOLD_MEDIUM={_HARDCODED_MEDIUM_SENTINEL}. "
-            "These are NOT data-derived and MUST NOT be cited in the paper. "
-            "Run: python calibrate_thresholds.py"
+    if not _CALIB_JSON_PATH.exists():
+        msg = (
+            "[CONFIG] ❌ logs/calibration_results.json NOT FOUND. "
+            "Dynamic AE thresholds are required for this research project. "
+            "Run: `python calibrate_thresholds.py` to generate them."
         )
+        _cfg_log.error(msg)
+        raise FileNotFoundError(msg)
 
-    return _HARDCODED_HIGH_SENTINEL, _HARDCODED_MEDIUM_SENTINEL
+    try:
+        data = json.loads(_CALIB_JSON_PATH.read_text())
+        high   = float(data["recommended_MSE_THRESHOLD_HIGH"])
+        medium = float(data["recommended_MSE_THRESHOLD_MEDIUM"])
+
+        # Sanity-check the P90/P99 collapse issue documented in the paper.
+        # If the gap is < 0.002 the three-tier severity system collapses.
+        p90 = data.get("p90", medium)
+        p99 = data.get("p99", high)
+        if abs(p99 - p90) < 0.002:
+            _cfg_log.warning(
+                "[CONFIG] ⚠️  AE threshold collapse detected: "
+                f"P90={p90:.6f}  P99={p99:.6f}  gap={abs(p99-p90):.6f} < 0.002. "
+                "Three-tier severity system is functionally degraded. "
+                "Consider the parallel fusion architecture (AE + GNN scores combined) "
+                "as documented in the Tier 2.5 experiment."
+            )
+
+        _cfg_log.info(
+            f"[CONFIG] AE thresholds loaded from calibration JSON — "
+            f"HIGH={high:.6f}  MEDIUM={medium:.6f}"
+        )
+        return high, medium
+
+    except Exception as exc:
+        msg = (
+            f"[CONFIG] ❌ Failed to parse calibration_results.json: {exc}. "
+            "Run: `python calibrate_thresholds.py` to regenerate it."
+        )
+        _cfg_log.error(msg)
+        raise ValueError(msg) from exc
 
 
 # Resolved at import time — every consumer (api_server, dashboard, dashboard_service)
