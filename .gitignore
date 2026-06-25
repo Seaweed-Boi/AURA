@@ -44,3 +44,6 @@ frontend/dist/
 
 # reports
 reports/
+
+#training 
+saved_models/
