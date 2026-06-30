@@ -185,58 +185,61 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
     Strategy (controlled by cfg.FL_ROOT_DATA_SOURCE):
     -------------------------------------------------
     "real" (default for research paper):
-      Loads a randomly selected benign partition from NF-UNSW-NB15-v3 via
-      data_loader.  This gives the server gradient a direction grounded in
-      the actual benign traffic manifold rather than a Gaussian approximation,
-      leading to higher cosine-similarity separation between honest and
-      Byzantine client updates.
+      Loads a GLOBALLY REPRESENTATIVE benign sample from NF-UNSW-NB15-v3.
+      It explicitly avoids using specific client partitions to ensure the 
+      server gradient is unbiased, preventing false-positive Byzantine flags 
+      on honest Non-IID clients.
 
     "synthetic" (fallback / dataset-unavailable):
-      Gaussian samples in the 0.35–0.50 range, matching the empirically
-      observed mean of Monday CSV benign traffic after MinMax scaling.
-
-    The function always falls back to synthetic if the real load raises any
-    exception, so it is safe to call even without the dataset present.
-
-    Shape: [n_samples, FEATURE_DIM] on CPU.
+      Gaussian samples in the 0.35–0.50 range.
     """
     if cfg.FL_ROOT_DATA_SOURCE == "real":
         try:
-            import random as _random
-            from aura.data_loader import load_client_partition, CICIDSDataLoader
-            # Pick a random org partition to avoid the server always using the
-            # same subset (avoids an implicit bias towards one organisation).
-            _orgs = ["hospital", "bank", "university", "isp", "retail"]
-            _org  = _random.choice(_orgs)
-            _cid  = f"org_{_org}_{_orgs.index(_org) + 1}"
+            import pandas as pd
+            from aura.data_loader import CICIDSDataLoader, DATASET_PATH
+            
             _loader = CICIDSDataLoader()
             _scaler = _loader.fit_scaler()
-            _train, _ = load_client_partition(client_id=_cid, scaler=_scaler)
-            # Sub-sample to exactly n_samples (or all if fewer available)
-            if len(_train) >= n_samples:
-                idxs = torch.randperm(len(_train))[:n_samples]
-                root = _train[idxs]
+            
+            # Load the global CSV directly
+            df = _loader._load_csv(str(DATASET_PATH))
+            label_col = 'Label' if 'Label' in df.columns else cfg.LABEL_COL.strip()
+
+            # Isolate all benign traffic globally
+            if pd.api.types.is_numeric_dtype(df[label_col]):
+                benign_df = df[df[label_col] == 0]
             else:
-                # Tile if the partition is smaller than requested
-                repeats = (n_samples // len(_train)) + 1
-                root = _train.repeat(repeats, 1)[:n_samples]
+                benign_df = df[df[label_col].str.strip().str.upper() == "BENIGN"]
+
+            # Sample globally so all org behaviors are represented
+            sampled_df = benign_df.sample(n=min(n_samples, len(benign_df)), random_state=42)
+            
+            X = sampled_df[_loader._feature_cols].values.astype(np.float32)
+            X_scaled = _scaler.transform(X).clip(0, 1)
+            
+            root = torch.tensor(X_scaled, dtype=torch.float32)
+
+            # Tile if the available dataset is smaller than requested
+            if len(root) < n_samples:
+                repeats = (n_samples // len(root)) + 1
+                root = root.repeat(repeats, 1)[:n_samples]
+
             logger.info(
-                f"[FLTrust] Root dataset loaded from real partition "
-                f"'{_cid}' ({len(root)} samples)."
+                f"[FLTrust] Global real root dataset loaded "
+                f"({len(root)} unbiased samples)."
             )
             return root
+            
         except Exception as _e:
             logger.warning(
                 f"[FLTrust] Real root dataset unavailable ({_e}). "
                 "Falling back to synthetic Gaussian root."
             )
-    # Synthetic fallback: Gaussian samples centred in the normal traffic range.
-    # Normal traffic clusters around 0.35–0.50 in MinMax-normalised NF-UNSW space.
+            
+    # Synthetic fallback
     data = torch.rand(n_samples, cfg.FEATURE_DIM) * 0.15 + 0.35
     logger.info(f"[FLTrust] Synthetic Gaussian root dataset generated ({n_samples} samples).")
     return data
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # FLTrust Aggregation (Upgrade 6 — active path in aggregate_fit; Krum is legacy fallback only)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,6 +406,8 @@ class KrumFedAURA(FedAvg):
 
     def __init__(
         self,
+        fraction_fit:          float = 1.0,
+        fraction_evaluate:     float = 1.0,
         min_fit_clients:       int   = cfg.FL_MIN_CLIENTS,
         min_available_clients: int   = cfg.FL_MIN_AVAILABLE,
         num_rounds:            int   = cfg.FL_NUM_ROUNDS,
@@ -411,6 +416,8 @@ class KrumFedAURA(FedAvg):
     ):
         # Configure FedAvg base (we override aggregation but keep its scheduling)
         super().__init__(
+            fraction_fit          = fraction_fit,
+            fraction_evaluate     = fraction_evaluate,
             min_fit_clients       = min_fit_clients,
             min_available_clients = min_available_clients,
             # Round config function: tells clients how many local epochs to run

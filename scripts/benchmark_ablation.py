@@ -194,6 +194,43 @@ def calibrate_ae_threshold(
     return threshold, mean, std
 
 
+def calibrate_gnn_platt(stgnn: AuraSTGNN, calibration_windows: list, device: torch.device):
+    """
+    Fit a Logistic Regression model on the raw GNN outputs to calibrate them
+    into true probabilities (Platt Scaling).
+    """
+    from sklearn.linear_model import LogisticRegression
+    
+    all_scores, all_labels = [], []
+    logger.info("Calibrating GNN with Platt Scaling on calibration windows...")
+    for graph, labels in calibration_windows:
+        x = graph["x"].to(device)
+        edge_index = graph["edge_index"].to(device)
+        num_nodes = x.shape[0]
+        node_labels = derive_node_labels(labels, edge_index, num_nodes, device)
+        
+        with torch.no_grad():
+            scores, _ = stgnn(x, edge_index)
+        
+        all_scores.append(scores.cpu().numpy())
+        all_labels.append(node_labels.cpu().numpy())
+    
+    X = np.concatenate(all_scores).reshape(-1, 1)
+    y = np.concatenate(all_labels)
+    
+    if len(np.unique(y)) < 2:
+        logger.warning("Calibration set lacks both classes! Cannot fit Platt Scaler. Using dummy.")
+        class DummyScaler:
+            def predict_proba(self, X):
+                return np.hstack((1 - X, X))
+        return DummyScaler()
+        
+    scaler = LogisticRegression()
+    scaler.fit(X, y)
+    logger.info("Platt Scaler fit successfully.")
+    return scaler
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EMA Temporal Persistence Tracker (Mode D)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +332,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         "Macro-F1": round(macro_f1, 6),
         "FPR": round(fpr, 6),
     }
+    # Area Under Curve requires continuous scores, not just binary 0/1 predictions
 
     if y_score is not None and len(np.unique(y_true)) > 1:
         try:
@@ -392,7 +430,7 @@ def run_mode_a(ae: FlowAutoencoder, test_windows: list, threshold: float,
             np.concatenate(all_y_score))
 
 
-def run_mode_b(stgnn: AuraSTGNN, test_windows: list, device: torch.device,
+def run_mode_b(stgnn: AuraSTGNN, platt_scaler, test_windows: list, device: torch.device,
                gnn_threshold: float = 0.5) -> tuple:
     """Mode B — GraphSAGE Only (Doc Config B). AE is bypassed entirely."""
     all_y_true, all_y_pred, all_y_score = [], [], []
@@ -405,17 +443,22 @@ def run_mode_b(stgnn: AuraSTGNN, test_windows: list, device: torch.device,
         node_labels = derive_node_labels(edge_labels, graph["edge_index"], num_nodes, device)
         with torch.no_grad():
             scores, _ = stgnn(x, edge_index)
-        y_pred = (scores > gnn_threshold).long()
+            
+        scores_np = scores.cpu().numpy().reshape(-1, 1)
+        calibrated_probs = platt_scaler.predict_proba(scores_np)[:, 1]
+        calibrated_tensor = torch.tensor(calibrated_probs, device=device, dtype=torch.float32)
+
+        y_pred = (calibrated_tensor > gnn_threshold).long()
 
         all_y_true.append(node_labels.cpu().numpy())
         all_y_pred.append(y_pred.cpu().numpy())
-        all_y_score.append(scores.cpu().numpy())
+        all_y_score.append(calibrated_probs)
 
     return (np.concatenate(all_y_true), np.concatenate(all_y_pred),
             np.concatenate(all_y_score))
 
 
-def run_mode_c(ae: FlowAutoencoder, stgnn: AuraSTGNN, test_windows: list,
+def run_mode_c(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows: list,
                threshold: float, device: torch.device,
                gnn_threshold: float = 0.5) -> tuple:
     """
@@ -445,11 +488,17 @@ def run_mode_c(ae: FlowAutoencoder, stgnn: AuraSTGNN, test_windows: list,
         y_score = node_residual.clone()
 
         if ae_flagged.sum() > 0:
+            # Only run GraphSAGE on the nodes the AE thought were suspicious
             with torch.no_grad():
                 gnn_scores, _ = stgnn(x, edge_index)
-            gnn_decision = (gnn_scores > gnn_threshold).long()
-            y_pred[ae_flagged] = gnn_decision[ae_flagged]
-            y_score[ae_flagged] = gnn_scores[ae_flagged]
+                
+            gnn_scores_flagged = gnn_scores[ae_flagged].cpu().numpy().reshape(-1, 1)
+            calibrated_probs = platt_scaler.predict_proba(gnn_scores_flagged)[:, 1]
+            calibrated_tensor = torch.tensor(calibrated_probs, device=device, dtype=torch.float32)
+            
+            gnn_decision = (calibrated_tensor > gnn_threshold).long()
+            y_pred[ae_flagged] = gnn_decision
+            y_score[ae_flagged] = calibrated_tensor
 
         all_y_true.append(node_labels.cpu().numpy())
         all_y_pred.append(y_pred.cpu().numpy())
@@ -459,7 +508,7 @@ def run_mode_c(ae: FlowAutoencoder, stgnn: AuraSTGNN, test_windows: list,
             np.concatenate(all_y_score))
 
 
-def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, test_windows: list,
+def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows: list,
                ema_mean: float, ema_std: float, device: torch.device,
                gnn_threshold: float = 0.5) -> tuple:
     """
@@ -482,7 +531,7 @@ def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, test_windows: list,
 
     for graph, edge_labels in test_windows:
         x = graph["x"].to(device)
-        edge_index = graph["edge_index"].to(device)
+        edge_index = graph["edge_index"].to(dvice)
         edge_attr = graph["edge_attr"].to(device)
         num_nodes = x.shape[0]
 
@@ -501,9 +550,14 @@ def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, test_windows: list,
         if ema_flagged.sum() > 0:
             with torch.no_grad():
                 gnn_scores, _ = stgnn(x, edge_index)
-            gnn_decision = (gnn_scores > gnn_threshold).long()
-            y_pred[ema_flagged] = gnn_decision[ema_flagged]
-            y_score[ema_flagged] = gnn_scores[ema_flagged]
+                
+            gnn_scores_flagged = gnn_scores[ema_flagged].cpu().numpy().reshape(-1, 1)
+            calibrated_probs = platt_scaler.predict_proba(gnn_scores_flagged)[:, 1]
+            calibrated_tensor = torch.tensor(calibrated_probs, device=device, dtype=torch.float32)
+            
+            gnn_decision = (calibrated_tensor > gnn_threshold).long()
+            y_pred[ema_flagged] = gnn_decision
+            y_score[ema_flagged] = calibrated_tensor
 
         all_y_true.append(node_labels.cpu().numpy())
         all_y_pred.append(y_pred.cpu().numpy())
@@ -616,6 +670,8 @@ def main():
         ae, calibration_windows, device, percentile=args.ae_percentile
     )
 
+    platt_scaler = calibrate_gnn_platt(stgnn, calibration_windows, device)
+
     # ── 4. Run the 4 ablation modes ──────────────────────────────────────────
     results = OrderedDict()
 
@@ -643,17 +699,17 @@ def main():
     )
     run_and_record(
         "B: GraphSAGE Only",
-        lambda: run_mode_b(stgnn, test_windows, device, args.gnn_threshold),
+        lambda: run_mode_b(stgnn, platt_scaler, test_windows, device, args.gnn_threshold),
         auc_approx=False,
     )
     run_and_record(
         "C: Sequential Cascade (AE+GraphSAGE, no EMA)",
-        lambda: run_mode_c(ae, stgnn, test_windows, ae_threshold, device, args.gnn_threshold),
+        lambda: run_mode_c(ae, stgnn, platt_scaler, test_windows, ae_threshold, device, args.gnn_threshold),
         auc_approx=True,
     )
     run_and_record(
         "D: Cascade + EMA Persistence",
-        lambda: run_mode_d(ae, stgnn, test_windows, ema_mean, ema_std, device, args.gnn_threshold),
+        lambda: run_mode_d(ae, stgnn, platt_scaler, test_windows, ema_mean, ema_std, device, args.gnn_threshold),
         auc_approx=True,
     )
 

@@ -2,31 +2,43 @@
 calibrate_thresholds.py — AURA Threshold Calibration & Feature Audit
 ======================================================================
 
-Run this ONCE before any demo. It does two things:
+Run this ONCE after training (`python train.py`) to derive data-driven
+thresholds from the NF-UNSW-NB15-v3 benign traffic distribution.
+It does two things:
 
   1. THRESHOLD CALIBRATION
-     Loads the pre-trained autoencoder and runs it over clean Monday CSV
-     (benign normal traffic only). Prints percentile statistics of the
-     resulting MSE distribution and recommends concrete values for:
-       config.MSE_THRESHOLD_HIGH   (→ 99th-percentile of normal MSE)
-       config.MSE_THRESHOLD_MEDIUM (→ 90th-percentile of normal MSE)
+     Loads the pre-trained autoencoder (`saved_models/autoencoder_best.pth`)
+     and runs it over the NF-UNSW-NB15-v3 dataset (benign rows only).
+     Prints percentile statistics of the resulting MSE distribution and
+     writes concrete, data-derived values to logs/calibration_results.json:
+       recommended_MSE_THRESHOLD_HIGH   (→ 99th-percentile of normal MSE)
+       recommended_MSE_THRESHOLD_MEDIUM (→ 90th-percentile of normal MSE)
+     config.py reads this file at import time — so the thresholds are
+     always tied to the actual trained model, never a magic number.
 
   2. FEATURE INDEX AUDIT
-     Reads the actual column ordering from Monday CSV (after stripping
-     whitespace, exactly as data_loader does) and compares every entry
-     in config.FEATURE_INDEX_MAP against the real column position.
+     Reads the actual column ordering from NF-UNSW-NB15-v3.csv (after
+     stripping whitespace, exactly as data_loader does) and compares every
+     entry in config.FEATURE_INDEX_MAP against the real column position.
      Prints PASS / MISMATCH / MISSING for each key so you can fix any
      off-by-one errors before the injection pipeline silently corrupts
      wrong features.
 
+Prerequisite
+------------
+    The autoencoder MUST be trained first:
+
+        python train.py --ae-only
+
+    If `saved_models/autoencoder_best.pth` does not exist this script will
+    exit immediately with a fatal error.  There is no fallback training path
+    here — calibration on random weights is meaningless.
+
 Usage
 -----
-    python calibrate_thresholds.py              # uses saved AE checkpoint
-    python calibrate_thresholds.py --train-quick # trains a fresh AE quickly then calibrates
-
-If no checkpoint is found and --train-quick is not passed, the script
-falls back to a randomly-initialised AE and notes that numbers
-are meaningless --- you MUST train first.
+    python calibrate_thresholds.py              # full calibration + audit
+    python calibrate_thresholds.py --audit-only # feature audit only
+    python calibrate_thresholds.py --calibrate-only # MSE calibration only
 """
 
 import argparse
@@ -51,20 +63,28 @@ log = logging.getLogger("calibrate")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 AE_CHECKPOINT = cfg.MODELS_DIR / "autoencoder_best.pth"
-BENIGN_CSV    = "Monday-WorkingHours.pcap_ISCX.csv"
+# The primary dataset for this project: NF-UNSW-NB15-v3
+DATASET_CSV   = "NF-UNSW-NB15-v3.csv"
 
 # How many graph windows to sample for calibration (more = better estimate)
 MAX_CALIBRATION_WINDOWS = 200
 
 
+
 # =============================================================================
-# 1. LOAD OR TRAIN AUTOENCODER
+# 1. LOAD AUTOENCODER  (no training — must be pre-trained via train.py)
 # =============================================================================
 
-def load_or_train_ae(train_quick: bool) -> tuple[FlowAutoencoder, bool]:
+def load_ae(trained_required: bool = True) -> FlowAutoencoder:
     """
-    Returns (ae_model, is_trained).
-    is_trained=False means the model is random and numbers are garbage.
+    Load the pre-trained autoencoder checkpoint.
+
+    Exits immediately with a fatal error if the checkpoint does not exist.
+    Calibration on random weights is meaningless, so there is no fallback
+    training path here.
+
+    To train the model run:
+        python train.py --ae-only
     """
     ae = FlowAutoencoder()
 
@@ -74,52 +94,25 @@ def load_or_train_ae(train_quick: bool) -> tuple[FlowAutoencoder, bool]:
         ae.load_state_dict(state)
         ae.eval()
         log.info("Checkpoint loaded successfully.")
-        return ae, True
+        return ae
 
-    if train_quick:
-        log.warning("No checkpoint found — running quick training (5 epochs on Monday benign data).")
-        _quick_train(ae)
-        ae.eval()
-        return ae, True
-
-    log.error(
-        "No checkpoint found at %s and --train-quick not passed.\n"
-        "MSE numbers will be meaningless (random weights).\n"
-        "Run:  python train.py --ae-only --quick   first, then re-run this script.",
-        AE_CHECKPOINT,
+    log.critical(
+        "\n"
+        "=" * 68 + "\n"
+        "  FATAL: autoencoder checkpoint not found\n"
+        f"  Expected: {AE_CHECKPOINT}\n"
+        "\n"
+        "  Calibration on an untrained (random-weight) model produces\n"
+        "  meaningless thresholds. There is no quick-train fallback here.\n"
+        "\n"
+        "  Train the model first, then re-run calibration:\n"
+        "      python train.py --ae-only\n"
+        "      python calibrate_thresholds.py\n"
+        "=" * 68
     )
-    ae.eval()
-    return ae, False
+    sys.exit(1)
 
 
-def _quick_train(ae: FlowAutoencoder, epochs: int = 5):
-    """Very fast AE training pass — only for immediate demo needs."""
-    import torch.optim as optim
-
-    loader = CICIDSDataLoader(load_fraction=0.1)
-    scaler = loader.fit_scaler()
-
-    optimiser = optim.Adam(ae.parameters(), lr=cfg.AE_LEARNING_RATE)
-    ae.train()
-
-    for epoch in range(1, epochs + 1):
-        epoch_loss = []
-        for graph, _ in loader.stream_graphs(scaler, csv_files=[BENIGN_CSV]):
-            edge_attr = graph["edge_attr"]   # [E, 78]
-            if edge_attr.shape[0] == 0:
-                continue
-            optimiser.zero_grad()
-            x_hat, z = ae(edge_attr)
-            loss = torch.nn.functional.mse_loss(x_hat, edge_attr)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(ae.parameters(), max_norm=1.0)
-            optimiser.step()
-            epoch_loss.append(loss.item())
-        log.info(f"  Quick-train epoch {epoch}/{epochs}  mean_loss={np.mean(epoch_loss):.6f}")
-
-    cfg.MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    torch.save(ae.state_dict(), AE_CHECKPOINT)
-    log.info(f"Quick-trained AE saved to {AE_CHECKPOINT}")
 
 
 # =============================================================================
@@ -128,26 +121,32 @@ def _quick_train(ae: FlowAutoencoder, epochs: int = 5):
 
 def collect_normal_mse(ae: FlowAutoencoder) -> np.ndarray:
     """
-    Stream the Monday (benign) CSV through the AE and collect per-flow MSE.
+    Stream the NF-UNSW-NB15-v3 dataset through the AE and collect per-flow
+    MSE for benign rows only (Label == 0).
+
+    The NF-UNSW-NB15-v3 dataset is the single CSV used throughout the project
+    and contains both benign and attack flows.  Only benign flows are used here
+    to characterise the normal reconstruction-error distribution.
+
     Returns a flat numpy array of MSE values.
     """
     loader = CICIDSDataLoader(load_fraction=cfg.DATA_LOAD_FRACTION)
-    log.info("Fitting scaler on benign data …")
+    log.info("Fitting scaler on NF-UNSW-NB15-v3 data …")
     scaler = loader.fit_scaler()
 
     all_mse = []
     windows_processed = 0
 
-    log.info(f"Streaming benign windows (max {MAX_CALIBRATION_WINDOWS}) …")
-    for graph, labels in loader.stream_graphs(scaler, csv_files=[BENIGN_CSV]):
+    log.info(f"Streaming benign windows from {DATASET_CSV} (max {MAX_CALIBRATION_WINDOWS}) …")
+    for graph, labels in loader.stream_graphs(scaler, csv_files=[DATASET_CSV]):
         # Only use edges labelled benign (label=0) — pure normal traffic
-        edge_attr = graph["edge_attr"]    # [E, 78]
+        edge_attr = graph["edge_attr"]    # [E, F]
         benign_mask = (labels == 0)
 
         if benign_mask.sum() == 0:
             continue
 
-        x_benign = edge_attr[benign_mask]   # [E', 78]
+        x_benign = edge_attr[benign_mask]   # [E', F]
         mse = ae.anomaly_score(x_benign)    # [E']  — no_grad inside
         all_mse.extend(mse.cpu().numpy().tolist())
 
@@ -160,24 +159,24 @@ def collect_normal_mse(ae: FlowAutoencoder) -> np.ndarray:
     return all_mse
 
 
+
 # =============================================================================
 # 3. PRINT STATISTICS & RECOMMENDATIONS
 # =============================================================================
 
-def print_mse_report(mse_values: np.ndarray, is_trained: bool):
-    """Print the MSE distribution report with threshold recommendations."""
+def print_mse_report(mse_values: np.ndarray):
+    """Print the MSE distribution report with threshold recommendations.
+
+    The model is guaranteed to be trained at this point (load_ae() calls
+    sys.exit(1) if the checkpoint is absent), so no is_trained guard needed.
+    """
 
     print("\n" + "=" * 70)
-    print("  AURA — AUTOENCODER MSE CALIBRATION REPORT")
+    print("  AURA — AUTOENCODER MSE CALIBRATION REPORT (NF-UNSW-NB15-v3)")
     print("=" * 70)
 
-    if not is_trained:
-        print("\n  ⚠️  WARNING: Model is UNTRAINED (random weights).")
-        print("     Run 'python train.py --ae-only --quick' first.")
-        print("     These numbers are MEANINGLESS.\n")
-
     if len(mse_values) == 0:
-        print("  ❌ No MSE samples collected. Check CSV path.")
+        print("  ❌ No MSE samples collected. Check that dataset/NF-UNSW-NB15-v3.csv exists.")
         return
 
     percentiles = [50, 75, 90, 95, 99, 99.5, 99.9]
@@ -252,7 +251,7 @@ def audit_feature_index_map():
     print("  AURA — FEATURE_INDEX_MAP AUDIT")
     print("=" * 70)
 
-    benign_path = cfg.CSV_DIR / BENIGN_CSV
+    benign_path = cfg.CSV_DIR / DATASET_CSV
     if not benign_path.exists():
         print(f"\n  ❌ CSV not found: {benign_path}")
         print("     Cannot audit feature ordering without the source CSV.")
@@ -282,9 +281,8 @@ def audit_feature_index_map():
         print(f"  ✓  Feature count matches FEATURE_DIM.")
     print()
 
-    # Build a reverse map: NF-UNSW-NB15-v3 column name variants → config key
-    # The CSV uses proper names like "Destination Port", "Flow Duration" etc.
-    # We need to map config keys (snake_case) to likely CSV column names.
+    # Build a reverse map: NF-UNSW-NB15-v3 column name variants → config key.
+    # The CSV uses UPPER_SNAKE_CASE names (e.g. "FLOW_DURATION_MILLISECONDS").
     # We do a case-insensitive substring match as a heuristic.
 
     # Explicit canonical mapping: config_key → expected CSV column substring
@@ -410,11 +408,11 @@ def main():
 
     # ── MSE Calibration ───────────────────────────────────────────────────────
     if not args.audit_only:
-        ae, is_trained = load_or_train_ae(args.train_quick)
+        ae = load_ae()
         mse_values = collect_normal_mse(ae)
-        print_mse_report(mse_values, is_trained)
+        print_mse_report(mse_values)
 
-        if is_trained and len(mse_values) > 0:
+        if len(mse_values) > 0:
             p90 = float(np.percentile(mse_values, 90))
             p99 = float(np.percentile(mse_values, 99))
 
