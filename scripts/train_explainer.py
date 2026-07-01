@@ -6,9 +6,12 @@ Pipeline
 --------
 1. Load the NF-UNSW-NB15-v3 validation/test split via CICIDSDataLoader.
 2. Load the pre-trained FlowAutoencoder.
-3. Pass data through the AE and compute absolute residual vectors: |x - x̂|.
-4. Train a RandomForestClassifier (n_estimators=50, max_depth=10)
-   where X = residuals [N, F], y = detailed string attack label.
+3. Pass data through the AE and compute:
+     - Absolute residual vectors: |x - x̂|  [N, F]
+     - Bottleneck latent vectors: z          [N, latent_dim]
+   Then concatenate → feature matrix [N, F + latent_dim].
+4. Train a RandomForestClassifier (n_estimators=500, max_depth=10)
+   where X = concat(residuals, latent) [N, F+L], y = detailed attack label.
 5. Save the trained classifier to saved_models/explainer_rf.pkl.
 
 Usage
@@ -27,7 +30,7 @@ import numpy as np
 import pandas as pd
 import torch
 import joblib
-from sklearn.ensemble import RandomForestClassifier
+from lightgbm import LGBMClassifier
 from sklearn.metrics import classification_report
 
 # ── Project imports ──────────────────────────────────────────────────────────
@@ -105,38 +108,57 @@ def load_labelled_data(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Residual Computation
+# Feature Extraction: Residuals ∥ Latent vectors
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_residuals(
+def compute_features(
     ae: FlowAutoencoder,
     X: np.ndarray,
     batch_size: int = 2048,
-) -> np.ndarray:
+) -> tuple:
     """
-    Run X through the autoencoder and return |x - x̂| per sample.
+    Run X through the autoencoder and return both:
+      - |x - x̂|  (absolute residuals, shape [N, F])
+      - z         (bottleneck latent vectors, shape [N, latent_dim])
+
+    The concatenated matrix ``concat([residuals, latent], axis=1)`` is returned
+    as the primary feature vector for the RF classifier, giving it both the
+    reconstruction-error signal *and* the compressed semantic representation.
 
     Returns
     -------
-    residuals : np.ndarray [N, F]  — absolute reconstruction error vectors
+    features        : np.ndarray [N, F + latent_dim] — concatenated feature matrix
+    residual_vectors: np.ndarray [N, F]              — raw residuals (for importances)
+    latent_vectors  : np.ndarray [N, latent_dim]     — AE bottleneck activations
     """
     ae.eval()
     device = next(ae.parameters()).device
 
-    residuals_list = []
+    residual_list = []
+    latent_list   = []
     n = len(X)
 
     for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
+        end     = min(start + batch_size, n)
         x_batch = torch.tensor(X[start:end], dtype=torch.float32).to(device)
 
         with torch.no_grad():
-            x_hat, _ = ae(x_batch)
-            res = (x_batch - x_hat).abs().cpu().numpy()
+            x_hat, z = ae(x_batch)
+            residual_list.append((x_batch - x_hat).abs().cpu().numpy())
+            latent_list.append(z.cpu().numpy())
 
-        residuals_list.append(res)
+    residual_vectors = np.concatenate(residual_list, axis=0)
+    latent_vectors   = np.concatenate(latent_list,   axis=0)
 
-    return np.concatenate(residuals_list, axis=0)
+    features = np.concatenate(
+        [
+            residual_vectors,
+            latent_vectors,
+        ],
+        axis=1,
+    )
+
+    return features, residual_vectors, latent_vectors
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -193,10 +215,12 @@ def main():
 
     ae = ae.to(device).eval()
 
-    # ── Step 3: Compute residuals |x - x̂| ───────────────────────────────────
-    print("[3/5] Computing residual vectors |x - x̂| …")
-    residuals = compute_residuals(ae, X_scaled)
-    print(f"  Residual matrix shape: {residuals.shape}")
+    # ── Step 3: Compute residuals + latent vectors ───────────────────────────
+    print("[3/5] Computing residual & latent feature vectors …")
+    features, residual_vectors, latent_vectors = compute_features(ae, X_scaled)
+    print(f"  Residual vectors shape : {residual_vectors.shape}")
+    print(f"  Latent vectors shape   : {latent_vectors.shape}")
+    print(f"  Combined feature shape : {features.shape}")
 
     # ── Step 4: Filter to attack-only for training ───────────────────────────
     # The RF learns to distinguish BETWEEN attack types, so benign rows are
@@ -204,8 +228,18 @@ def main():
     # dominate the classifier).  At inference time, the explainer is only
     # invoked when Layer 1 has already flagged an anomaly.
     attack_mask = y_labels != "Benign"
-    X_train = residuals[attack_mask]
-    y_train = y_labels[attack_mask]
+    X_raw    = features[attack_mask]
+    # Force plain NumPy str array — PyArrow-backed pandas arrays cause
+    # joblib ChunkedArray fancy-indexing failures in child processes.
+    y_train  = np.array(y_labels[attack_mask], dtype=str)
+
+    # Build a named DataFrame so LightGBM 4.x doesn't warn about missing
+    # feature names when predict() receives a plain numpy slice.
+    n_residual = residual_vectors.shape[1]
+    n_latent   = latent_vectors.shape[1]
+    col_names  = ([f"residual_{i}" for i in range(n_residual)] +
+                  [f"latent_{i}"   for i in range(n_latent)])
+    X_train = pd.DataFrame(X_raw, columns=col_names)
 
     print(f"  Attack samples for training: {len(X_train)}")
     print(f"  Attack classes: {np.unique(y_train).tolist()}")
@@ -215,21 +249,23 @@ def main():
         print("    Ensure the dataset contains rows with Label=1 and an 'Attack' column.")
         sys.exit(1)
 
-# ── Step 5: Train RandomForestClassifier ─────────────────────────────────
-    print("[4/5] Training RandomForestClassifier …")
+# ── Step 5: Train LGBMClassifier ────────────────────────────────────────
+    print("[4/5] Training LGBMClassifier …")
     from sklearn.model_selection import StratifiedKFold, cross_val_predict
 
-    clf = RandomForestClassifier(
-        n_estimators=50,
+    clf = LGBMClassifier(
+        n_estimators=200,  # 200 is plenty for LGBM; 500 × 5 folds sequentially is too slow
         max_depth=10,
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,          # must be 1 — joblib conflict when cross_val_predict also uses n_jobs=-1
         class_weight="balanced",
+        verbose=-1,        # suppress LightGBM's per-tree stdout
     )
 
     # Honest evaluation: every sample predicted by a model that never saw it
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    y_pred_cv = cross_val_predict(clf, X_train, y_train, cv=skf, n_jobs=-1)
+    # n_jobs=1: LightGBM's internal thread pool conflicts with joblib multiprocessing
+    y_pred_cv = cross_val_predict(clf, X_train, y_train, cv=skf, n_jobs=1)
     print(f"\n  Cross-validated classification report (5-fold stratified):")
     print(classification_report(y_train, y_pred_cv, zero_division=0))
 
@@ -256,6 +292,98 @@ def main():
     print(f"\n{'='*60}")
     print("  Explainer RF training complete!")
     print(f"{'='*60}\n")
+
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(
+        y_train,
+        y_pred_cv,
+        labels=clf.classes_
+    )
+
+    _print_confusion_matrix(cm, clf.classes_)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pretty confusion-matrix printer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _print_confusion_matrix(cm: np.ndarray, class_names: np.ndarray) -> None:
+    """
+    Print a colour-coded confusion matrix to stdout.
+
+    - Diagonal cells (correct predictions) are highlighted in green.
+    - Off-diagonal cells are highlighted in red proportional to magnitude.
+    - Per-class recall is shown at the end of each row.
+    - No external dependencies beyond stdlib ANSI codes.
+    """
+    # ── ANSI helpers ─────────────────────────────────────────────────────────
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    GREEN  = "\033[92m"
+    RED    = "\033[91m"
+    YELLOW = "\033[93m"
+    CYAN   = "\033[96m"
+    DIM    = "\033[2m"
+
+    n          = len(class_names)
+    col_w      = 8                          # cell width
+    label_w    = max(len(c) for c in class_names) + 2
+    row_totals = cm.sum(axis=1, keepdims=True).clip(1)  # avoid /0
+    max_off    = cm.copy(); np.fill_diagonal(max_off, 0)
+    max_off_v  = max_off.max() or 1
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    print(f"\n{BOLD}{CYAN}{'─'*60}{RESET}")
+    print(f"{BOLD}{CYAN}  Confusion Matrix  (rows = actual, cols = predicted){RESET}")
+    print(f"{BOLD}{CYAN}{'─'*60}{RESET}\n")
+
+    # Column headers (abbreviated to col_w-1 chars)
+    header = " " * label_w
+    for cls in class_names:
+        abbr = cls[:col_w - 1].center(col_w)
+        header += f"{BOLD}{abbr}{RESET}"
+    header += f"  {BOLD}Recall{RESET}"
+    print(header)
+    print(DIM + " " * label_w + ("─" * col_w) * n + "  " + "──────" + RESET)
+
+    # ── Rows ─────────────────────────────────────────────────────────────────
+    for i, cls in enumerate(class_names):
+        row_label = f"{BOLD}{cls[:label_w - 1]:<{label_w - 1}}{RESET} "
+        row_str   = row_label
+
+        for j in range(n):
+            val = cm[i, j]
+            cell = str(val).center(col_w)
+            if i == j:                              # diagonal → green
+                row_str += f"{GREEN}{BOLD}{cell}{RESET}"
+            elif val == 0:
+                row_str += f"{DIM}{cell}{RESET}"   # zero → dim
+            else:
+                # Intensity: dim red → bright red based on relative magnitude
+                intensity = val / max_off_v
+                if intensity > 0.5:
+                    row_str += f"{RED}{BOLD}{cell}{RESET}"
+                else:
+                    row_str += f"{YELLOW}{cell}{RESET}"
+
+        recall = cm[i, i] / row_totals[i, 0]
+        recall_col = (
+            f"{GREEN}{BOLD}" if recall >= 0.9 else
+            f"{YELLOW}"     if recall >= 0.7 else
+            f"{RED}"
+        )
+        row_str += f"  {recall_col}{recall:6.1%}{RESET}"
+        print(row_str)
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    overall_acc = np.diag(cm).sum() / cm.sum()
+    print(DIM + " " * label_w + ("─" * col_w) * n + "  " + "──────" + RESET)
+    print(
+        f"{BOLD}  Overall accuracy: "
+        f"{GREEN if overall_acc >= 0.9 else YELLOW if overall_acc >= 0.7 else RED}"
+        f"{overall_acc:.2%}{RESET}   "
+        f"{DIM}(5-fold cross-validated){RESET}\n"
+    )
 
 
 if __name__ == "__main__":

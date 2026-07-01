@@ -406,6 +406,8 @@ class KrumFedAURA(FedAvg):
 
     def __init__(
         self,
+        fraction_fit:          float = 1.0,
+        fraction_evaluate:     float = 1.0,
         min_fit_clients:       int   = cfg.FL_MIN_CLIENTS,
         min_available_clients: int   = cfg.FL_MIN_AVAILABLE,
         num_rounds:            int   = cfg.FL_NUM_ROUNDS,
@@ -414,6 +416,8 @@ class KrumFedAURA(FedAvg):
     ):
         # Configure FedAvg base (we override aggregation but keep its scheduling)
         super().__init__(
+            fraction_fit          = fraction_fit,
+            fraction_evaluate     = fraction_evaluate,
             min_fit_clients       = min_fit_clients,
             min_available_clients = min_available_clients,
             # Round config function: tells clients how many local epochs to run

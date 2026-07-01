@@ -145,7 +145,7 @@ def run_experiment(strategy_name: str, num_clients: int, byzantine_ratio: float,
         num_clients=num_clients,
         config=fl.server.ServerConfig(num_rounds=2),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.0},
+        client_resources={"num_cpus": 4, "num_gpus": 0.0},
     )
     logger.info(f"Finished {strategy_name} simulation.")
 

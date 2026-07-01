@@ -17,6 +17,7 @@ CSV's/
 # Saved models (binary, large)
 saved_models/*.pth
 saved_models/*.joblib
+saved_models/explainer_rf.pkl
 
 # Logs (runtime generated)
 logs/
