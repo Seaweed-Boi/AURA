@@ -47,6 +47,10 @@ import os
 import sys
 from pathlib import Path
 
+# Force UTF-8 encoding for stdout to prevent crashes when printing emojis on Windows
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 import numpy as np
 import torch
 
