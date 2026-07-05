@@ -209,7 +209,7 @@ class CICIDSDataLoader:
             return series.values.astype(np.int64)
         return (series.str.strip().str.upper() != "BENIGN").astype(np.int64).values
 
-    def fit_scaler(self) -> MinMaxScaler:
+    def fit_scaler(self, train_indices=None) -> MinMaxScaler:
         df = self._load_csv(CSV_FILES[0])
         label_col = 'Label' if 'Label' in df.columns else cfg.LABEL_COL.strip()
         
@@ -223,11 +223,20 @@ class CICIDSDataLoader:
 
         X_benign = benign_df[self._feature_cols].values.astype(np.float32)
         X_clean, _ = _isolationforest_sanitise(X_benign)
-
+        
+        if train_indices is not None:
+            X_train = X_clean[train_indices]
+            logger_msg = f"MinMaxScaler fitted strictly on provided train_indices split ({len(X_train)} rows)."
+        else:
+            # fallback: chronological 80/20 if no split provided
+            n_train = int(len(X_clean) * 0.8)
+            X_train = X_clean[:n_train]
+            logger_msg = f"MinMaxScaler fitted strictly on chronologically isolated train split ({n_train} rows)."
+        
         scaler = MinMaxScaler(feature_range=(0, 1))
-        scaler.fit(X_clean)
+        scaler.fit(X_train)
         self._scaler = scaler
-        logger.info("MinMaxScaler fitted on sanitised benign baseline.")
+        logger.info(logger_msg)
         return scaler
 
     def stream_graphs(self, scaler: MinMaxScaler, csv_files: Optional[List[str]] = None) -> Generator[Tuple[Dict, torch.Tensor], None, None]:

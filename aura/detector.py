@@ -356,8 +356,12 @@ class AURAInferenceEngine:
                 inferred_attack = expl["inferred_attack"]
                 match_score     = expl["match_score"]
                 group_residuals = expl["group_residuals"]
-            except Exception as _e:
-                logger.debug(f"Explainer skipped: {_e}")
+            except Exception as e:
+                raise RuntimeError(
+                    f"FATAL: Explainer failed during inference. "
+                    f"Silent Normal label would corrupt evaluation metrics. "
+                    f"Original error: {e}"
+                )
         # ── Layer 2: Contextual Validator (only if L1 triggered) ──────────
         gnn_scores      = None
         triggered_nodes = []

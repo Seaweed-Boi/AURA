@@ -102,7 +102,7 @@ GNN_EPOCHS     = 50
 EMA_ALPHA = 0.05
 
 # An alert is raised when:  loss > EMA_mean + (EMA_SIGMA_MULTIPLIER × EMA_std)
-EMA_SIGMA_MULTIPLIER = 1.5
+EMA_SIGMA_MULTIPLIER = 3.0
 
 # Warm-up batches before thresholds are active (avoids cold-start false alarms)
 EMA_WARMUP_BATCHES = 5
@@ -118,7 +118,7 @@ TEMPORAL_WINDOW_SECONDS = 300   # 5 minutes — configurable
 # EMA trajectory persistence threshold.
 # K consecutive readings above 2.0σ → MEDIUM floor.
 # K consecutive readings above 2.5σ → HIGH floor.
-K_CONSECUTIVE_READINGS  = 2     # configurable
+K_CONSECUTIVE_READINGS  = 5     # configurable
 
 
 # ─────────────────────────────────────────────────────────────────────────────

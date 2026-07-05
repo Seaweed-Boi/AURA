@@ -232,9 +232,8 @@ def print_mse_report(mse_values: np.ndarray):
         print(f"  ✓  MEDIUM threshold looks reasonable.")
 
     print()
-    print("  To apply recommendations, edit config.py lines 217–218:")
-    print(f"    MSE_THRESHOLD_HIGH   = {p99:.4f}")
-    print(f"    MSE_THRESHOLD_MEDIUM = {p90:.4f}")
+    print("  ✓ Recommendations saved to logs/calibration_results.json.")
+    print("  config.py will dynamically load these values automatically at runtime.")
     print("=" * 70)
 
 
