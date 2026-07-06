@@ -390,6 +390,57 @@ def load_client_partition(
     )
     return X_train, X_val
 
+def load_client_subpartition(
+    client_idx: int,
+    scaler: Optional[MinMaxScaler] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load a sub-partition for one of 10 benchmark clients.
+    
+    Maps 10 clients onto 5 real org partitions by halving each:
+      clients 0-4 → first half of org 0-4 partition
+      clients 5-9 → second half of org 0-4 partition
+    
+    This gives 10 genuinely non-overlapping datasets from 5 real
+    IP-hashed org partitions — no two clients share the same rows.
+    """
+    org_idx   = client_idx % len(_ORG_NAMES)   # 0-4
+    org_key   = _ORG_NAMES[org_idx]
+    is_second = client_idx >= len(_ORG_NAMES)   # True for clients 5-9
+
+    # Reuse existing partition loader with canonical org ID
+    _org_nums = {"hospital":1, "bank":2, "university":3, "isp":4, "retail":5}
+    client_id = f"org_{org_key}_{_org_nums[org_key]}"
+
+    X_train, X_val = load_client_partition(
+        client_id=client_id,
+        scaler=scaler,
+    )
+
+    # Split train in half — each half is a distinct non-overlapping subset
+    half = len(X_train) // 2
+    if half < 1:
+        raise RuntimeError(
+            f"Partition for {org_key} too small to sub-partition "
+            f"({len(X_train)} rows). Increase DATA_LOAD_FRACTION."
+        )
+
+    if is_second:
+        X_train = X_train[half:]   # second half → clients 5-9
+    else:
+        X_train = X_train[:half]   # first half  → clients 0-4
+
+    # Val split is shared between both halves of same org
+    # (val data is always the 20% held out by load_client_partition,
+    #  independent of the train split — no leakage)
+    logger.info(
+        "[subpartition] client_idx=%d  org=%s  half=%s  train=%d  val=%d",
+        client_idx, org_key,
+        "second" if is_second else "first",
+        len(X_train), len(X_val),
+    )
+    return X_train, X_val
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI Sanity Check
 # ─────────────────────────────────────────────────────────────────────────────
