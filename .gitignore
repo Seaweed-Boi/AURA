@@ -51,6 +51,7 @@ scripts/verify_contrastive_value.py
 scripts/verify_loss_units.py
 scripts/verify_no_leakage.py
 scripts/outputs/
+scripts/verify_split_consistency.py
 
 #training 
 saved_models/

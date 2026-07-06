@@ -81,6 +81,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import config as cfg
 from aura.data_loader import CICIDSDataLoader, CSV_FILES
 from aura.models import AURAModelBundle, AuraSTGNN, FlowAutoencoder
+from aura.split_manager import get_canonical_split
 
 from sklearn.metrics import (
     average_precision_score,
@@ -371,9 +372,9 @@ def collect_test_windows(
     test_fraction: float = 0.20,
 ) -> tuple:
     """
-    Stream ALL windows in order, then return only the final `test_fraction`
-    portion (preserving order — required by Mode D's EMA tracker), plus a
-    small calibration set from the start of the training portion.
+    Stream ALL windows in order, then delegate to get_canonical_split() which
+    applies a stratified chronological 80/20 split and persists the indices to
+    splits/canonical_split.npz so every script uses the identical test set.
     """
     logger.info("Streaming all graph windows to isolate the test split …")
 
@@ -394,38 +395,16 @@ def collect_test_windows(
             f"{cfg.CSV_DIR} and DATA_LOAD_FRACTION ({cfg.DATA_LOAD_FRACTION}) is sufficient."
         )
 
-    # ── Stratified split: ensure attacks appear in BOTH train and test ──────
-    # NF-UNSW-NB15-v3 has attacks concentrated at the start of the file,
-    # so a naive tail-slice produces a test set with 0 attacks.
-    # We separate windows by whether they contain ANY attack edge, split each
-    # bucket 80/20, then re-sort by original index to preserve temporal order
-    # within each partition (required by Mode D's EMA tracker).
-    attack_idx   = [i for i, (_, lbl) in enumerate(all_windows) if lbl.sum() > 0]
-    benign_idx   = [i for i, (_, lbl) in enumerate(all_windows) if lbl.sum() == 0]
-
-    def _split(indices):
-        cut = int(len(indices) * (1.0 - test_fraction))
-        return indices[:cut], indices[cut:]
-
-    atk_train, atk_test   = _split(attack_idx)
-    ben_train, ben_test   = _split(benign_idx)
-
-    train_idx = sorted(atk_train + ben_train)
-    test_idx  = sorted(atk_test  + ben_test)
-
-    train_windows = [all_windows[i] for i in train_idx]
-    test_windows  = [all_windows[i] for i in test_idx]
-
-
-    n_calib = max(5, int(len(train_windows) * 0.10))
-    calibration_windows = train_windows[:n_calib]
+    calibration_windows, train_windows, test_windows = get_canonical_split(
+        all_windows, test_fraction=test_fraction
+    )
 
     logger.info(
         f"Total windows: {total} | Train: {len(train_windows)} | "
         f"Calibration (from train): {len(calibration_windows)} | Test: {len(test_windows)}"
     )
 
-    total_edges = sum(labels.numel() for _, labels in test_windows)
+    total_edges   = sum(labels.numel() for _, labels in test_windows)
     total_attacks = sum(labels.sum().item() for _, labels in test_windows)
     logger.info(
         f"Test set attack ratio: {total_attacks}/{total_edges} "
