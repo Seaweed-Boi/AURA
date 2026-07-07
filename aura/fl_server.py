@@ -230,16 +230,12 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
             )
             return root
             
-        except Exception as _e:
-            logger.warning(
-                f"[FLTrust] Real root dataset unavailable ({_e}). "
-                "Falling back to synthetic Gaussian root."
+        except Exception as e:
+            raise RuntimeError(
+                f"FATAL: Real root dataset unavailable. "
+                f"Falling back to synthetic Gaussian noise invalidates FLTrust evaluation. "
+                f"Fix the dataset path. Original error: {e}"
             )
-            
-    # Synthetic fallback
-    data = torch.rand(n_samples, cfg.FEATURE_DIM) * 0.15 + 0.35
-    logger.info(f"[FLTrust] Synthetic Gaussian root dataset generated ({n_samples} samples).")
-    return data
 # ─────────────────────────────────────────────────────────────────────────────
 # FLTrust Aggregation (Upgrade 6 — active path in aggregate_fit; Krum is legacy fallback only)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -633,8 +629,12 @@ class KrumFedAURA(FedAvg):
         if registry_path.exists():
             try:
                 registry = json.loads(registry_path.read_text())
-            except Exception:
-                registry = {}
+            except Exception as e:
+                raise RuntimeError(
+                    f"FATAL: Hash registry read failed. "
+                    f"Wiping registry silently breaks audit trail verification. "
+                    f"Original error: {e}"
+                )
         registry[version] = model_hash
         registry_path.write_text(json.dumps(registry, indent=2))
         logger.info(f"[REGISTRY] {version} written to trusted registry.")

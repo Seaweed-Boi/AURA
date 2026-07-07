@@ -262,25 +262,13 @@ class FlowAutoencoder(nn.Module):
         margin: float = cfg.CONTRASTIVE_MARGIN,
     ) -> torch.Tensor:
         """
-        Combined MSE + Contrastive loss.
-
+        # Contrastive term removed after diagnostic — see scripts/verify_contrastive_value.py. MSE-only produces superior separation (AUROC 0.9692 vs 0.9648).
+        Pure MSE loss.
+        
         MSE term:
             L_recon = (1/B) Σ ||x - x_hat||²₂
-
-        Contrastive term (Negative Sampling — only used if z_neg provided):
-            L_contrast = max(0, margin - ||z - z_neg||₂)
-
-            Goal: push attack latents (z_neg) at least `margin` distance away
-            from the normal latent distribution.  This makes the MSE spike on
-            attacks even more pronounced, reducing false negatives.
         """
         l_recon = F.mse_loss(x_hat, x)
-
-        if z_neg is not None:
-            # L2 distance between positive (normal) and negative (attack) latents
-            dist    = torch.norm(z - z_neg, p=2, dim=1)           # [B]
-            l_cont  = F.relu(margin - dist).mean()                 # hinge loss
-            return l_recon + 0.1 * l_cont                          # weighted sum
         return l_recon
 
     def anomaly_score(self, x: torch.Tensor) -> torch.Tensor:

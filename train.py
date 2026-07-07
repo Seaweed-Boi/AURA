@@ -18,11 +18,12 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset
 
 import config as cfg
 from aura.data_loader import CICIDSDataLoader, CSV_FILES
 from aura.models import FlowAutoencoder, AuraSTGNN, AURAModelBundle
+from aura.split_manager import get_canonical_split
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -64,31 +65,20 @@ def train_autoencoder(
         batch_size=cfg.AE_BATCH_SIZE
     )
 
-    contrastive_start = int(epochs * 0.65)
     best_val_loss = float("inf")
 
     print(f"\n{'='*58}")
     print(f"  Training FlowAutoencoder: {epochs} epochs  device={device}")
-    print(f"  Contrastive phase starts at epoch {contrastive_start}")
     print(f"{'='*58}")
 
     for epoch in range(1, epochs + 1):
         ae.train()
         epoch_loss = 0.0
-        use_contrastive = epoch > contrastive_start
-
         for (batch,) in train_loader:
             optimizer.zero_grad()
             x_hat, z = ae(batch)
 
-            z_neg = None
-            if use_contrastive:
-                # Synthetic negative: perturb normal features to simulate attack
-                z_neg = ae.encode(
-                    (batch + torch.randn_like(batch) * 0.3).clamp(0, 1)
-                ).detach()
-
-            loss = ae.reconstruction_loss(batch, x_hat, z, z_neg=z_neg)
+            loss = ae.reconstruction_loss(batch, x_hat, z)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(ae.parameters(), max_norm=1.0)
             optimizer.step()
@@ -110,10 +100,9 @@ def train_autoencoder(
             torch.save(ae.state_dict(), cfg.MODELS_DIR / "autoencoder_best.pth")
 
         if epoch % 5 == 0 or epoch == 1:
-            phase = "MSE+Contrast" if use_contrastive else "MSE only"
             print(f"  Epoch {epoch:3d}/{epochs}  "
                   f"train={epoch_loss/len(train_loader):.5f}  "
-                  f"val={val_loss:.5f}  [{phase}]  "
+                  f"val={val_loss:.5f}  "
                   f"lr={scheduler.get_last_lr()[0]:.6f}")
 
     # Load best model
@@ -199,39 +188,46 @@ def main():
     loader = CICIDSDataLoader(load_fraction=0.15 if args.quick else cfg.DATA_LOAD_FRACTION)
     scaler = loader.fit_scaler()
 
-    # ── Step 2: Collect ALL benign flows into a flat tensor  ─────────────────
-    print("[Phase 2] Collecting benign training data …")
-    benign_flows = []
+    # ── Step 2: Collect ALL windows for canonical split ──────────────────────
+    print("[Phase 2] Streaming all windows and computing canonical split …")
+    all_windows = []
     attack_graphs_for_gnn = []
-
-    # Use NF-UNSW-NB15-v3 (single CSV); benign flows filtered by Label==0
     for graph, labels in loader.stream_graphs(scaler, csv_files=[CSV_FILES[0]]):
-        # Collect benign flow features for AE baseline training
-        benign_flows.append(graph["edge_attr"])
-
+        all_windows.append((graph, labels))
         if len(attack_graphs_for_gnn) < 100:
             attack_graphs_for_gnn.append((graph, labels))
 
-        if len(benign_flows) >= 50:  # Cap for speed during hackathon
-            break
+    if not all_windows:
+        logger.error("No windows collected. Check CSV paths in config.py.")
+        sys.exit(1)
+
+    # Use the canonical split so train.py and benchmark_ablation.py see
+    # identical train/test partitions.  The split is saved to
+    # splits/canonical_split.npz and reloaded on every subsequent run.
+    _, train_windows, _ = get_canonical_split(all_windows, test_fraction=0.20)
+
+    # Extract edge-level benign flows from the canonical *train* windows only.
+    # Never include flows from the test windows in the AE training set.
+    benign_flows = [
+        graph["edge_attr"]
+        for graph, labels in train_windows
+        if (labels == 0).any()
+    ]
 
     if not benign_flows:
-        logger.error("No benign data collected.  Check CSV paths in config.py.")
+        logger.error("No benign data in train windows. Check CSV paths in config.py.")
         sys.exit(1)
 
     all_benign = torch.cat(benign_flows, dim=0)   # [N_total, F]
-    logger.info(f"Total benign flows collected: {all_benign.shape[0]}")
+    logger.info(f"Total benign flows collected (train windows only): {all_benign.shape[0]}")
 
-    # Train/val split (80/20)
-    n_val      = int(len(all_benign) * 0.20)
-    n_train    = len(all_benign) - n_val
-    train_data, val_data = random_split(
-        all_benign, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
-    train_tensor = all_benign[list(train_data.indices)]
-    val_tensor   = all_benign[list(val_data.indices)]
+    # Val split: chronological last 20% of the train-window benign flows
+    n_val   = int(len(all_benign) * 0.20)
+    n_train = len(all_benign) - n_val
+    train_tensor = all_benign[:n_train]
+    val_tensor   = all_benign[n_train:]
 
+    logger.info(f"AE train flows: {n_train}  |  val flows: {n_val}")
     # ── Step 3: Train Autoencoder ────────────────────────────────────────────
     print("[Phase 3] Training FlowAutoencoder …")
     ae = FlowAutoencoder()
