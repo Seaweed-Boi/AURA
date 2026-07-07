@@ -510,7 +510,9 @@ def run_mode_c(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows
 
 def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows: list,
                ema_mean: float, ema_std: float, device: torch.device,
-               gnn_threshold: float = 0.5) -> tuple:
+               gnn_threshold: float = 0.5,
+               ema_sigma_mult: float = cfg.EMA_SIGMA_MULTIPLIER,
+               k_consecutive: int = cfg.K_CONSECUTIVE_READINGS) -> tuple:
     """
     Mode D — Sequential Cascade + EMA Temporal Persistence (Doc Config D).
 
@@ -526,12 +528,16 @@ def run_mode_d(ae: FlowAutoencoder, stgnn: AuraSTGNN, platt_scaler, test_windows
     collect_test_windows() preserves stream order, so this holds as long as
     test_windows is passed through unmodified.
     """
-    tracker = NodeEMATracker(init_mean=ema_mean, init_std=ema_std)
+    tracker = NodeEMATracker(
+        init_mean=ema_mean, init_std=ema_std,
+        sigma_mult=ema_sigma_mult,
+        k_consecutive=k_consecutive,
+    )
     all_y_true, all_y_pred, all_y_score = [], [], []
 
     for graph, edge_labels in test_windows:
         x = graph["x"].to(device)
-        edge_index = graph["edge_index"].to(dvice)
+        edge_index = graph["edge_index"].to(device)
         edge_attr = graph["edge_attr"].to(device)
         num_nodes = x.shape[0]
 
