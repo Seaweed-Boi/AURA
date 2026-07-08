@@ -171,8 +171,27 @@ class SAGEConv(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Layer 1: Unsupervised Autoencoder (Statistical Tripwire)
+# Layer 1: Unsupervised Autoencoder (Statistical Tripwire) & AttackHead
 # ─────────────────────────────────────────────────────────────────────────────
+
+class AttackHead(nn.Module):
+    """
+    Lightweight classifier operating on AE bottleneck representations.
+    Input: 16-dim z vector from FlowAutoencoder encoder
+    Output: scalar probability that the flow is attack traffic
+    Parameter count: ~145 — negligible overhead
+    """
+    def __init__(self, latent_dim: int = 16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
 
 class FlowAutoencoder(nn.Module):
     """
@@ -262,25 +281,13 @@ class FlowAutoencoder(nn.Module):
         margin: float = cfg.CONTRASTIVE_MARGIN,
     ) -> torch.Tensor:
         """
-        Combined MSE + Contrastive loss.
-
+        # Contrastive term removed after diagnostic — see scripts/verify_contrastive_value.py. MSE-only produces superior separation (AUROC 0.9692 vs 0.9648).
+        Pure MSE loss.
+        
         MSE term:
             L_recon = (1/B) Σ ||x - x_hat||²₂
-
-        Contrastive term (Negative Sampling — only used if z_neg provided):
-            L_contrast = max(0, margin - ||z - z_neg||₂)
-
-            Goal: push attack latents (z_neg) at least `margin` distance away
-            from the normal latent distribution.  This makes the MSE spike on
-            attacks even more pronounced, reducing false negatives.
         """
         l_recon = F.mse_loss(x_hat, x)
-
-        if z_neg is not None:
-            # L2 distance between positive (normal) and negative (attack) latents
-            dist    = torch.norm(z - z_neg, p=2, dim=1)           # [B]
-            l_cont  = F.relu(margin - dist).mean()                 # hinge loss
-            return l_recon + 0.1 * l_cont                          # weighted sum
         return l_recon
 
     def anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
@@ -428,6 +435,7 @@ class AURAModelBundle(nn.Module):
         super().__init__()
         self.autoencoder = FlowAutoencoder()
         self.stgnn       = AuraSTGNN()
+        self.attack_head = AttackHead()
 
     def forward(self, x, edge_index):
         """Not called directly — models are invoked separately in the pipeline."""

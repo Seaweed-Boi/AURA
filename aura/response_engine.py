@@ -110,7 +110,8 @@ class AURAResponseEngine:
         # Track recently isolated/throttled nodes to prevent duplicates
         # Maps node_id → unix timestamp of last action
         self._actioned_nodes: dict = {}
-        self._dedup_window_sec = 30   # Suppress duplicate actions within 30s
+        # Use config constant so benchmark and live engine share the same window
+        self._dedup_window_sec = cfg.RESPONSE_DEDUP_WINDOW_SEC
 
         logger.info(
             f"ResponseEngine ready.  Critical allowlist: "
@@ -173,6 +174,26 @@ class AURAResponseEngine:
             self._actioned_nodes[node_id] = time.time()
 
         return records
+
+    def act_with_latency(
+        self,
+        event: AnomalyEvent,
+    ) -> tuple:
+        """
+        Identical to act() but also returns wall-clock escalation latency in ms.
+
+        Used exclusively by benchmark_hitl_response.py to measure the time
+        from AnomalyEvent emission to IncidentRecord written.
+
+        Returns
+        -------
+        (records: List[IncidentRecord], latency_ms: float)
+        """
+        import time as _time
+        t0 = _time.monotonic()
+        records = self.act(event)
+        latency_ms = (_time.monotonic() - t0) * 1000.0
+        return records, latency_ms
 
     # ------------------------------------------------------------------
     # Policy Tiers

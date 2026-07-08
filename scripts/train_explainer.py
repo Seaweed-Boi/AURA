@@ -203,13 +203,17 @@ def main():
         try:
             bundle = AURAModelBundle()
             bundle.load_state_dict(
-                torch.load(str(bundle_path), map_location=device)
+                torch.load(str(bundle_path), map_location=device, weights_only=True),
+                strict=False
             )
             ae = bundle.autoencoder
             print(f"  ✓ Loaded AE from {bundle_path}")
         except Exception as e:
-            logger.warning(f"Bundle load failed, using fresh AE: {e}")
-            print(f"  ⚠ Using untrained AE (bundle load failed: {e})")
+            raise RuntimeError(
+                f"FATAL: AE bundle failed to load. "
+                f"All downstream metrics will be invalid. "
+                f"Fix the bundle path before re-running. Original error: {e}"
+            )
     else:
         print(f"  ⚠ No bundle found at {bundle_path} — using untrained AE")
 
@@ -292,6 +296,52 @@ def main():
     print(f"\n{'='*60}")
     print("  Explainer RF training complete!")
     print(f"{'='*60}\n")
+    
+    # ── Step 7: Export Attack Statistics for Injection ───────────────────────
+    import json
+    
+    # Map raw dataset labels to config expected keys
+    label_mapping = {
+        "DoS": "ddos",
+        "Reconnaissance": "portscan",
+        "Exploits": "exploits",
+        "Fuzzers": "fuzzers",
+        "Backdoor": "backdoor",
+        "Benign": "benign",
+        # Missing ones get mapped to prevent KeyError
+        "Generic": "lateral",
+        "Shellcode": "exfil",
+        "Analysis": "web",
+    }
+    
+    attack_stats = {}
+    unique_labels = np.unique(y_labels)
+    for raw_class in unique_labels:
+        if raw_class not in label_mapping:
+            continue
+        out_key = label_mapping[raw_class]
+        class_mask = (y_labels == raw_class)
+        class_features = X_scaled[class_mask]
+        
+        attack_stats[out_key] = {
+            'min': class_features.min(axis=0).tolist(),
+            'max': class_features.max(axis=0).tolist(),
+            'mean': class_features.mean(axis=0).tolist(),
+            'p05': np.percentile(class_features, 5, axis=0).tolist(),
+            'p25': np.percentile(class_features, 25, axis=0).tolist(),
+            'p75': np.percentile(class_features, 75, axis=0).tolist(),
+            'p95': np.percentile(class_features, 95, axis=0).tolist(),
+            'n_samples': int(class_mask.sum())
+        }
+        
+    stats_path = Path('saved_models/attack_class_stats.json')
+    stats_path.parent.mkdir(exist_ok=True)
+    with open(stats_path, 'w') as f:
+        json.dump(attack_stats, f, indent=2)
+
+    print(f"attack_class_stats.json written to {stats_path}")
+    print(f"Classes: {list(attack_stats.keys())}")
+    print(f"Samples per class: {[(k, v['n_samples']) for k, v in attack_stats.items()]}\n")
 
     from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(

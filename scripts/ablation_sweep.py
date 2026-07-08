@@ -146,7 +146,7 @@ def main():
     parser = argparse.ArgumentParser(description="AURA ablation threshold/sensitivity sweeps")
     parser.add_argument("--bundle", type=str, default=str(cfg.MODELS_DIR / "aura_bundle.pth"))
     parser.add_argument("--load-fraction", type=float, default=cfg.DATA_LOAD_FRACTION)
-    parser.add_argument("--test-fraction", type=float, default=0.20)
+    parser.add_argument("--test-fraction", type=float, default=cfg.TEST_SPLIT_FRACTION)
     parser.add_argument("--gnn-threshold", type=float, default=0.5)
     parser.add_argument("--ae-percentiles", type=float, nargs="+", default=[85, 90, 95, 97, 99])
     parser.add_argument("--ema-sigmas", type=float, nargs="+", default=[1.0, 2.0, 3.0, 4.0])

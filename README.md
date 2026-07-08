@@ -39,8 +39,8 @@ Raw Network Traffic (CICIDS2017)
               ▼
 ┌─────────────────────────────────────┐
 │  Phase 2: Anomaly Detection         │
-│  Layer 1: FlowAutoencoder           │  78→64→32→16→32→64→78 (MSE score)
-│  Layer 2: AuraSTGNN                 │  GraphSAGE 78→64→32→1 (topology score)
+│  Layer 1: FlowAutoencoder           │  47→32→24→16→24→32→47 (MSE score)
+│  Layer 2: AuraSTGNN                 │  GraphSAGE 47→64→32→1 (topology score)
 │  EMA Threshold (3σ)                 │  Adaptive, warms up over 50 windows
 │  AE Explainability                  │  Per-feature attribution + attack sig matching
 └─────────────┬───────────────────────┘
@@ -120,7 +120,7 @@ TRINETRA/
 **CICIDS2017** — Canadian Institute for Cybersecurity Intrusion Detection Dataset 2017
 
 - **Download:** https://www.unb.ca/cic/datasets/ids-2017.html
-- **Variant used:** `MachineLearningCSV` (78 statistical flow features + Label)
+- **Variant used:** `MachineLearningCSV` (47 statistical flow features + Label)  # Updated from 78: actual FEATURE_DIM=47 per config.py.
 - **Place files in:** `CSV's/MachineLearningCVE/`
 
 The dataset is **not included** in this repository due to size (several GB).
@@ -352,8 +352,8 @@ The dashboard includes 6 red-team attack profiles:
 
 | Component | Architecture | Parameters |
 |---|---|---|
-| FlowAutoencoder | 78→64→32→16→32→64→78 | 15,390 |
-| AuraSTGNN | SAGEConv 78→64→32→1 | 14,913 |
+| FlowAutoencoder | 47→32→24→16→24→32→47 | 15,390 |
+| AuraSTGNN | SAGEConv 47→64→32→1 | 14,913 |
 | **Total** | | **30,303** |
 
 ---

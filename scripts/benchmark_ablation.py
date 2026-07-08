@@ -81,6 +81,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import config as cfg
 from aura.data_loader import CICIDSDataLoader, CSV_FILES
 from aura.models import AURAModelBundle, AuraSTGNN, FlowAutoencoder
+from aura.split_manager import get_canonical_split
 
 from sklearn.metrics import (
     average_precision_score,
@@ -356,12 +357,12 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
 def collect_test_windows(
     loader: CICIDSDataLoader,
     scaler,
-    test_fraction: float = 0.20,
+    test_fraction: float = cfg.TEST_SPLIT_FRACTION,
 ) -> tuple:
     """
-    Stream ALL windows in order, then return only the final `test_fraction`
-    portion (preserving order — required by Mode D's EMA tracker), plus a
-    small calibration set from the start of the training portion.
+    Stream ALL windows in order, then delegate to get_canonical_split() which
+    applies a stratified chronological 80/20 split and persists the indices to
+    splits/canonical_split.npz so every script uses the identical test set.
     """
     logger.info("Streaming all graph windows to isolate the test split …")
 
@@ -382,19 +383,16 @@ def collect_test_windows(
             f"{cfg.CSV_DIR} and DATA_LOAD_FRACTION ({cfg.DATA_LOAD_FRACTION}) is sufficient."
         )
 
-    test_start = int(total * (1.0 - test_fraction))
-    train_windows = all_windows[:test_start]
-    test_windows = all_windows[test_start:]
-
-    n_calib = max(5, int(len(train_windows) * 0.10))
-    calibration_windows = train_windows[:n_calib]
+    calibration_windows, train_windows, test_windows = get_canonical_split(
+        all_windows, test_fraction=test_fraction
+    )
 
     logger.info(
         f"Total windows: {total} | Train: {len(train_windows)} | "
         f"Calibration (from train): {len(calibration_windows)} | Test: {len(test_windows)}"
     )
 
-    total_edges = sum(labels.numel() for _, labels in test_windows)
+    total_edges   = sum(labels.numel() for _, labels in test_windows)
     total_attacks = sum(labels.sum().item() for _, labels in test_windows)
     logger.info(
         f"Test set attack ratio: {total_attacks}/{total_edges} "
@@ -623,7 +621,7 @@ def main():
     )
     parser.add_argument("--bundle", type=str, default=str(cfg.MODELS_DIR / "aura_bundle.pth"))
     parser.add_argument("--load-fraction", type=float, default=cfg.DATA_LOAD_FRACTION)
-    parser.add_argument("--test-fraction", type=float, default=0.20)
+    parser.add_argument("--test-fraction", type=float, default=cfg.TEST_SPLIT_FRACTION)
     parser.add_argument("--ae-percentile", type=float, default=95.0)
     parser.add_argument("--gnn-threshold", type=float, default=0.5)
     args = parser.parse_args()
