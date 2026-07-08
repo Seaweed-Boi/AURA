@@ -204,7 +204,7 @@ def main():
     # Use the canonical split so train.py and benchmark_ablation.py see
     # identical train/test partitions.  The split is saved to
     # splits/canonical_split.npz and reloaded on every subsequent run.
-    _, train_windows, _ = get_canonical_split(all_windows, test_fraction=0.20)
+    _, train_windows, _ = get_canonical_split(all_windows, test_fraction=cfg.TEST_SPLIT_FRACTION)
 
     # Extract edge-level benign flows from the canonical *train* windows only.
     # Never include flows from the test windows in the AE training set.
@@ -221,8 +221,8 @@ def main():
     all_benign = torch.cat(benign_flows, dim=0)   # [N_total, F]
     logger.info(f"Total benign flows collected (train windows only): {all_benign.shape[0]}")
 
-    # Val split: chronological last 20% of the train-window benign flows
-    n_val   = int(len(all_benign) * 0.20)
+    # Val split: chronological last 20% (or cfg.TEST_SPLIT_FRACTION) of the train-window benign flows
+    n_val   = int(len(all_benign) * cfg.TEST_SPLIT_FRACTION)
     n_train = len(all_benign) - n_val
     train_tensor = all_benign[:n_train]
     val_tensor   = all_benign[n_train:]

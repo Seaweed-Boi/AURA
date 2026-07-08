@@ -369,7 +369,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
 def collect_test_windows(
     loader: CICIDSDataLoader,
     scaler,
-    test_fraction: float = 0.20,
+    test_fraction: float = cfg.TEST_SPLIT_FRACTION,
 ) -> tuple:
     """
     Stream ALL windows in order, then delegate to get_canonical_split() which
@@ -633,7 +633,7 @@ def main():
     )
     parser.add_argument("--bundle", type=str, default=str(cfg.MODELS_DIR / "aura_bundle.pth"))
     parser.add_argument("--load-fraction", type=float, default=cfg.DATA_LOAD_FRACTION)
-    parser.add_argument("--test-fraction", type=float, default=0.20)
+    parser.add_argument("--test-fraction", type=float, default=cfg.TEST_SPLIT_FRACTION)
     parser.add_argument("--ae-percentile", type=float, default=95.0)
     parser.add_argument("--gnn-threshold", type=float, default=0.5)
     parser.add_argument(

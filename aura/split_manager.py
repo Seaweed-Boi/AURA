@@ -20,9 +20,10 @@ Design
 Usage
 -----
     from aura.split_manager import get_canonical_split
+    import config as cfg
 
     calibration_windows, train_windows, test_windows = get_canonical_split(
-        all_windows, test_fraction=0.20
+        all_windows, test_fraction=cfg.TEST_SPLIT_FRACTION
     )
 """
 
@@ -34,17 +35,18 @@ from typing import List, Tuple
 
 import numpy as np
 
+import config as cfg
+
 logger = logging.getLogger(__name__)
 
 # File that persists the canonical index arrays between runs
-_SPLIT_DIR  = Path(__file__).resolve().parent.parent / "splits"
-_SPLIT_FILE = _SPLIT_DIR / "canonical_split.npz"
+_SPLIT_FILE = cfg.SPLITS_DIR / "canonical_split.npz"
 
 
 def get_canonical_split(
     all_windows: List[Tuple],
-    test_fraction: float = 0.20,
-    calib_fraction: float = 0.10,
+    test_fraction: float = cfg.TEST_SPLIT_FRACTION,
+    calib_fraction: float = cfg.CALIB_SPLIT_FRACTION,
     force_recompute: bool = False,
 ) -> Tuple[List, List, List]:
     """
@@ -105,7 +107,7 @@ def get_canonical_split(
     test_idx  = sorted(atk_test  + ben_test)
 
     # ── Persist to disk ──────────────────────────────────────────────────────
-    _SPLIT_DIR.mkdir(parents=True, exist_ok=True)
+    cfg.SPLITS_DIR.mkdir(parents=True, exist_ok=True)
     np.savez(
         _SPLIT_FILE,
         total=np.array(total),

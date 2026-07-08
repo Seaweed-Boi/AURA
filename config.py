@@ -37,6 +37,9 @@ CONTRACTS_DIR = BASE_DIR / "contracts"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+SPLITS_DIR = BASE_DIR / "splits"
+SPLITS_DIR.mkdir(parents=True, exist_ok=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATASET  (NF-UNSW-NB15-v3)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +56,12 @@ BENIGN_LABEL = 0
 
 # Fraction of data to load per CSV (1.0 = all rows; reduce for speed during dev)
 DATA_LOAD_FRACTION = 1.0   # 30 % is enough to demo; use 1.0 for full training
+
+# Fraction of windows held out for test set in canonical split
+TEST_SPLIT_FRACTION = 0.20
+
+# Fraction of train windows used for threshold calibration
+CALIB_SPLIT_FRACTION = 0.10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GRAPH / TTL EDGE DECAY
