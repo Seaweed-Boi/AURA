@@ -55,7 +55,7 @@ LABEL_COL = "Label"
 BENIGN_LABEL = 0
 
 # Fraction of data to load per CSV (1.0 = all rows; reduce for speed during dev)
-DATA_LOAD_FRACTION = 1.0   # 30 % is enough to demo; use 1.0 for full training
+DATA_LOAD_FRACTION = 0.3   # 30 % is enough to demo; use 1.0 for full training
 
 # Fraction of windows held out for test set in canonical split
 TEST_SPLIT_FRACTION = 0.20
@@ -100,7 +100,14 @@ GNN_INPUT_DIM  = FEATURE_DIM
 GNN_HIDDEN_DIM = 64
 GNN_OUTPUT_DIM = 32          # Latent node embedding dimension
 GNN_LEARNING_RATE = 5e-4
-GNN_EPOCHS     = 50
+GNN_EPOCHS        = 50
+
+# Maximum graph windows collected for STGNN training per-phase.
+# Phase 2 seeds the GNN with this many windows from train_windows before
+# Phase 4 streams additional attack CSVs. Both phases cap at this value so
+# changing once here propagates everywhere. 100 is the research-grade default
+# that balances training speed vs. GNN coverage.
+GNN_ATTACK_GRAPH_CAP = 100
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DYNAMIC THRESHOLDING (Exponential Moving Average over batch MSE)
@@ -114,7 +121,7 @@ EMA_ALPHA = 0.05
 EMA_SIGMA_MULTIPLIER = 3.0
 
 # Warm-up batches before thresholds are active (avoids cold-start false alarms)
-EMA_WARMUP_BATCHES = 5
+EMA_WARMUP_BATCHES = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SEVERITY ENGINE — Temporal Accumulator + EMA Trajectory
@@ -172,10 +179,15 @@ FLTRUST_ROOT_SAMPLES   = 200
 # Kept separate from AE_LEARNING_RATE so it can be tuned independently.
 FLTRUST_SERVER_LR      = 1e-3
 
+# DC-FLTrust reference buffer configuration
+CH2_WARMUP_ROUNDS = 10          # rounds before AttackHead participates in federation
+CH2_REF_BUFFER_MAX = 5000       # maximum z vectors in dynamic reference buffer
+CH2_REF_BUFFER_MIN = 20         # minimum z vectors before dynamic reference activates
+
 # Trust score at or below this value causes the client to be flagged as Byzantine
 # in the detection log (fed into Upgrade 3).  ReLU already zeroes negatives;
 # this threshold lets you also zero out near-zero trust scores from noisy clients.
-FLTRUST_MIN_TRUST_SCORE = 0.05   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
+FLTRUST_MIN_TRUST_SCORE = 0.0   # 0.0 = ReLU only (strict); raise to e.g. 0.05 to be stricter
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESPONSE ENGINE — Critical Infrastructure Allowlist
@@ -427,11 +439,6 @@ def load_ae_thresholds() -> tuple[float, float, bool]:
     to proceed on sentinel values rather than silently using them.
     """
     if not _CALIB_JSON_PATH.exists():
-        import sys
-        if any("calibrate_thresholds" in arg for arg in sys.argv):
-            _cfg_log.warning("[CONFIG] calibration_results.json missing, but running calibration script. Using dummy thresholds to boot.")
-            return 0.7, 0.4
-            
         msg = (
             "[CONFIG] ⚠️  logs/calibration_results.json NOT FOUND. "
             "Falling back to SENTINEL AE thresholds so config.py can still be "
@@ -480,6 +487,29 @@ _ae_thresh_high, _ae_thresh_medium, AE_THRESHOLDS_CALIBRATED = load_ae_threshold
 
 MSE_THRESHOLD_HIGH   = _ae_thresh_high    # EMA-UCL P99 of benign MSE distribution
 MSE_THRESHOLD_MEDIUM = _ae_thresh_medium  # EMA-UCL P90 of benign MSE distribution
+def load_ch2_split_threshold() -> float:
+    if not _CALIB_JSON_PATH.exists():
+        raise FileNotFoundError(
+            f"Threshold calibration file missing: {_CALIB_JSON_PATH}. "
+            "Run calibrate_thresholds.py before starting the system."
+        )
+    try:
+        data = json.loads(_CALIB_JSON_PATH.read_text())
+        if "CH2_MSE_SPLIT_THRESHOLD" not in data:
+            raise KeyError("CH2_MSE_SPLIT_THRESHOLD missing from calibration file.")
+        return float(data["CH2_MSE_SPLIT_THRESHOLD"])
+    except Exception as e:
+        raise ValueError(f"Failed to read CH2_MSE_SPLIT_THRESHOLD from calibration: {e}")
+
+# DC-FLTrust two-pass split threshold
+# Flows above this threshold are considered potentially anomalous 
+# and routed to AttackHead for channel 2 analysis.
+# This is intentionally lower than MSE_THRESHOLD_HIGH (response engine)
+# because we want AttackHead to see all suspicious flows, not just
+# the most extreme ones. Set to P75 of benign MSE distribution.
+# Updated automatically by calibrate_thresholds.py alongside other thresholds.
+CH2_MSE_SPLIT_THRESHOLD = load_ch2_split_threshold()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA-DRIVEN ATTACK CORRUPTION PROFILES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -621,21 +651,20 @@ def load_attack_corruption_profiles() -> dict:
     """
     stats_path = MODELS_DIR / "attack_class_stats.json"
     if not stats_path.exists():
-        _cfg_log.warning(
-            "[CONFIG] ⚠️  saved_models/attack_class_stats.json NOT FOUND. "
-            "Using sentinel ATTACK_CORRUPTION_PROFILES — these are NOT data-derived. "
-            "Run: python scripts/train_explainer.py"
+        raise FileNotFoundError(
+            "[CONFIG] attack_class_stats.json NOT FOUND. "
+            "Channel 2 federation requires real data-derived profiles. "
+            "Run: python scripts/train_explainer.py before benchmarking. "
+            f"Expected path: {stats_path.resolve()}"
         )
-        return _SENTINEL_ATTACK_PROFILES
 
     try:
         stats_data = json.loads(stats_path.read_text())
     except Exception as exc:
-        _cfg_log.error(
+        raise ValueError(
             f"[CONFIG] Failed to parse attack_class_stats.json: {exc}. "
-            "Falling back to sentinel profiles."
+            "Channel 2 federation requires a valid data-derived profile JSON."
         )
-        return _SENTINEL_ATTACK_PROFILES
 
     # Build index → feature-key reverse map from FEATURE_INDEX_MAP
     idx_to_key: dict[int, str] = {v: k for k, v in FEATURE_INDEX_MAP.items()}
@@ -686,3 +715,29 @@ def load_attack_corruption_profiles() -> dict:
 # Resolved at import time — derived from NF-UNSW-NB15-v3 via attack_class_stats.json.
 # Falls back to sentinel profiles with WARNING if the JSON is absent.
 ATTACK_CORRUPTION_PROFILES: dict = load_attack_corruption_profiles()
+
+
+def preflight_dc_fltrust_check():
+    """Call at the top of any script using DC-FLTrust before round 1."""
+    import os, json
+    from datetime import datetime
+    
+    stats_path = MODELS_DIR / "attack_class_stats.json"
+    
+    if not stats_path.exists():
+        raise RuntimeError(
+            f"[PREFLIGHT FAIL] attack_class_stats.json missing at {stats_path}. "
+            "Run train_explainer.py first."
+        )
+    
+    mtime = os.path.getmtime(stats_path)
+    mtime_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+    
+    with open(stats_path) as f:
+        profiles = json.load(f)
+    
+    print(f"[PREFLIGHT PASS] attack_class_stats.json found.")
+    print(f"  Modified: {mtime_str}")
+    print(f"  Attack classes present: {list(profiles.keys())}")
+    print(f"  This timestamp should match your most recent train_explainer.py run.")
+    return True

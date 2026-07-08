@@ -171,8 +171,27 @@ class SAGEConv(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Layer 1: Unsupervised Autoencoder (Statistical Tripwire)
+# Layer 1: Unsupervised Autoencoder (Statistical Tripwire) & AttackHead
 # ─────────────────────────────────────────────────────────────────────────────
+
+class AttackHead(nn.Module):
+    """
+    Lightweight classifier operating on AE bottleneck representations.
+    Input: 16-dim z vector from FlowAutoencoder encoder
+    Output: scalar probability that the flow is attack traffic
+    Parameter count: ~145 — negligible overhead
+    """
+    def __init__(self, latent_dim: int = 16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
 
 class FlowAutoencoder(nn.Module):
     """
@@ -416,6 +435,7 @@ class AURAModelBundle(nn.Module):
         super().__init__()
         self.autoencoder = FlowAutoencoder()
         self.stgnn       = AuraSTGNN()
+        self.attack_head = AttackHead()
 
     def forward(self, x, edge_index):
         """Not called directly — models are invoked separately in the pipeline."""

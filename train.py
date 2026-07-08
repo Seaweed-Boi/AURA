@@ -191,11 +191,8 @@ def main():
     # ── Step 2: Collect ALL windows for canonical split ──────────────────────
     print("[Phase 2] Streaming all windows and computing canonical split …")
     all_windows = []
-    attack_graphs_for_gnn = []
     for graph, labels in loader.stream_graphs(scaler, csv_files=[CSV_FILES[0]]):
         all_windows.append((graph, labels))
-        if len(attack_graphs_for_gnn) < 100:
-            attack_graphs_for_gnn.append((graph, labels))
 
     if not all_windows:
         logger.error("No windows collected. Check CSV paths in config.py.")
@@ -221,7 +218,15 @@ def main():
     all_benign = torch.cat(benign_flows, dim=0)   # [N_total, F]
     logger.info(f"Total benign flows collected (train windows only): {all_benign.shape[0]}")
 
-    # Val split: chronological last 20% (or cfg.TEST_SPLIT_FRACTION) of the train-window benign flows
+    # Extract mixed graphs (benign + attack) from train windows for the GNN.
+    # Built from train_windows only — test windows never touch training logic.
+    attack_graphs_for_gnn = []
+    for graph, labels in train_windows:
+        attack_graphs_for_gnn.append((graph, labels))
+        if len(attack_graphs_for_gnn) >= cfg.GNN_ATTACK_GRAPH_CAP:  # Cap from config
+            break
+
+    # Val split: chronological last TEST_SPLIT_FRACTION of the train-window benign flows
     n_val   = int(len(all_benign) * cfg.TEST_SPLIT_FRACTION)
     n_train = len(all_benign) - n_val
     train_tensor = all_benign[:n_train]
@@ -240,7 +245,7 @@ def main():
         for csv_file in CSV_FILES[1:4]:   # Attack-containing CSVs
             for graph, labels in loader.stream_graphs(scaler, csv_files=[csv_file]):
                 attack_graphs_for_gnn.append((graph, labels))
-                if len(attack_graphs_for_gnn) >= 200:
+                if len(attack_graphs_for_gnn) >= cfg.GNN_ATTACK_GRAPH_CAP * 2:
                     break
 
         print(f"[Phase 4] Training AuraSTGNN on {len(attack_graphs_for_gnn)} graphs …")
