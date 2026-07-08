@@ -238,9 +238,12 @@ def _run_local_training_dual(
     # === Compute weight deltas for server transmission ===
     ae_delta = {k: ae.state_dict()[k].clone() - global_ae_weights[k]
                 for k in ae.state_dict()}
-    head_delta = {k: attack_head.state_dict()[k].clone() - global_head_weights[k]
-                  for k in attack_head.state_dict()}
-    
+    if len(high_mse_flows) > 0:
+        head_delta = {k: attack_head.state_dict()[k].clone() - global_head_weights[k]
+                      for k in attack_head.state_dict()}
+    else:
+        head_delta = None
+        
     logger.debug(
         f"Client round local: "
         f"benign_flows={len(benign_flows)}, high_mse_flows={len(high_mse_flows)}, "
@@ -255,11 +258,12 @@ def run_experiment(
     num_clients:     int,
     byzantine_ratio: float,
     rare_client:     bool = False,
-    mode:            str = "single_channel",
-    num_rounds:      int = 2,
+    mode:            str = "dc_fltrust",
+    num_rounds:      int = 10,
+    attack_mode:     str = "none"
 ):
     """
-    Run one complete federated learning simulation.
+    Run the AURA federation loop locally (no gRPC/Flower overhead).
 
     Parameters
     ----------
@@ -320,8 +324,8 @@ def run_experiment(
 
     # Federated rounds
     from aura.attack_reference import AttackReferenceBuffer
-    if mode == "dual_channel":
-        logger.info(f"[DC-FLTrust] CH2 MSE split threshold: {cfg.CH2_MSE_SPLIT_THRESHOLD:.6f} "
+    if mode in ["joint_dual", "dc_fltrust"]:
+        logger.debug(f"[{mode}] CH2 MSE split threshold: {cfg.CH2_MSE_SPLIT_THRESHOLD:.6f} "
               f"(P75 of benign distribution — flows above this route to AttackHead)")
               
         attack_ref_buffer = AttackReferenceBuffer(
@@ -443,24 +447,86 @@ def run_experiment(
                 for p, arr in zip(global_model.parameters(), global_arrays):
                     p.copy_(torch.tensor(arr, dtype=torch.float32))
 
-            if mode == "dual_channel":
-                from aura.fl_server import dc_fltrust_aggregate
-                # Server root training for channel 2 reference deltas
-                root_ae = FlowAutoencoder()
-                root_head = AttackHead()
-                root_ae.load_state_dict(global_model.autoencoder.state_dict())
-                root_head.load_state_dict(global_model.attack_head.state_dict())
-                root_ae_opt = torch.optim.Adam(root_ae.parameters(), lr=1e-3)
-                root_head_opt = torch.optim.Adam(root_head.parameters(), lr=1e-3)
+            from aura.fl_server import ae_only_fltrust_aggregate, joint_dual_fltrust_aggregate, dc_fltrust_aggregate
+            
+            # Server root training for channel 2 reference deltas
+            root_ae = FlowAutoencoder()
+            root_head = AttackHead()
+            root_ae.load_state_dict(global_model.autoencoder.state_dict())
+            root_head.load_state_dict(global_model.attack_head.state_dict())
+            root_ae_opt = torch.optim.Adam(root_ae.parameters(), lr=1e-3)
+            root_head_opt = torch.optim.Adam(root_head.parameters(), lr=1e-3)
+            
+            g_ae_w = {k: v.clone() for k, v in global_model.autoencoder.state_dict().items()}
+            g_head_w = {k: v.clone() for k, v in global_model.attack_head.state_dict().items()}
+            
+            r_ae_delta, r_head_delta, _, _, _ = _run_local_training_dual(
+                root_ae, root_head, root_data, root_ae_opt, root_head_opt, g_ae_w, g_head_w, mse_threshold_high=cfg.CH2_MSE_SPLIT_THRESHOLD
+            )
+            
+            c_ae_deltas = []
+            c_head_deltas = []
+            round_z_submissions = {}
+            
+            from scripts.experiments.byzantine_deception_experiment import _run_latent_inversion_byzantine, _run_true_labelflip_byzantine
+            
+            for idx, client in enumerate(clients):
+                is_byzantine = (roles[idx] == "byzantine")
                 
-                g_ae_w = {k: v.clone() for k, v in global_model.autoencoder.state_dict().items()}
-                g_head_w = {k: v.clone() for k, v in global_model.attack_head.state_dict().items()}
+                ae_opt = torch.optim.Adam(client.model.autoencoder.parameters(), lr=1e-3)
+                head_opt = torch.optim.Adam(client.model.attack_head.parameters(), lr=1e-3)
                 
-                r_ae_delta, r_head_delta, _, _, _ = _run_local_training_dual(
-                    root_ae, root_head, root_data, root_ae_opt, root_head_opt, g_ae_w, g_head_w, mse_threshold_high=cfg.CH2_MSE_SPLIT_THRESHOLD
+                with torch.no_grad():
+                    for p, arr in zip(client.model.autoencoder.parameters(), global_model.autoencoder.parameters()):
+                        p.copy_(arr)
+                    for p, arr in zip(client.model.attack_head.parameters(), global_model.attack_head.parameters()):
+                        p.copy_(arr)
+                        
+                if is_byzantine and attack_mode == 'latent_inversion':
+                    ae_delta, head_delta, z_buffer, n_benign, n_attack = _run_latent_inversion_byzantine(
+                        client.model.autoencoder, client.model.attack_head, client.train_data, ae_opt, head_opt,
+                        g_ae_w, g_head_w, mse_threshold_high=cfg.CH2_MSE_SPLIT_THRESHOLD, head_epochs=3
+                    )
+                elif is_byzantine and attack_mode == 'true_labelflip':
+                    ae_delta, head_delta, z_buffer, n_benign, n_attack = _run_true_labelflip_byzantine(
+                        client.model.autoencoder, client.model.attack_head, client.train_data, ae_opt, head_opt,
+                        g_ae_w, g_head_w, mse_threshold_high=cfg.CH2_MSE_SPLIT_THRESHOLD, head_epochs=3
+                    )
+                else:
+                    ae_delta, head_delta, z_buffer, n_benign, n_attack = _run_local_training_dual(
+                        client.model.autoencoder, client.model.attack_head, client.train_data, ae_opt, head_opt,
+                        g_ae_w, g_head_w, mse_threshold_high=cfg.CH2_MSE_SPLIT_THRESHOLD, head_epochs=3
+                    )
+                    
+                c_ae_deltas.append(ae_delta)
+                c_head_deltas.append(head_delta)
+                round_z_submissions[idx] = z_buffer
+                
+                logger.info(
+                    f"Client {idx} round {rnd}: "
+                    f"benign_flows={n_benign}, high_mse_flows={n_attack}, "
+                    f"z_buffer_size={sum(len(z) for z in z_buffer)}"
                 )
-                
-                client_round_counts = [rnd] * num_clients
+            
+            client_round_counts = [rnd] * num_clients
+            
+            if mode == 'ae_only':
+                new_ae, trust_scores = ae_only_fltrust_aggregate(
+                    c_ae_deltas, r_ae_delta
+                )
+                new_head = None
+                ch1_scores = trust_scores
+                ch2_scores = [0.0] * num_clients
+                classifications = ['HEALTHY' if t > 0.0 else 'BYZANTINE' for t in trust_scores]
+            elif mode == 'joint_dual':
+                new_ae, new_head, combined_scores, ch1_scores, ch2_scores = joint_dual_fltrust_aggregate(
+                    c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
+                    ch2_warmup_rounds=cfg.CH2_WARMUP_ROUNDS, ch1_weight=0.7
+                )
+                trust_scores = combined_scores
+                classifications = ['HEALTHY' if t > 0.0 else 'BYZANTINE' for t in trust_scores]
+            else:
+                # mode == 'dc_fltrust'
                 new_ae, new_head, ch1_scores, ch2_scores, classifications = dc_fltrust_aggregate(
                     c_ae_deltas, c_head_deltas, r_ae_delta, r_head_delta, client_round_counts,
                     ch2_warmup_rounds=cfg.CH2_WARMUP_ROUNDS,
@@ -469,34 +535,36 @@ def run_experiment(
                     current_round=rnd,
                     reference_attack_head=global_model.attack_head
                 )
-                # Reconstruct new_arrays from new_ae and new_head
-                # Not fully reconstructing the bundle parameters array here as this is a simulation.
-                new_arrays = global_arrays # keep global arrays intact for printing
                 trust_scores = ch1_scores
-                flagged_indices = [i for i, c in enumerate(classifications) if c == 'BYZANTINE']
+
+            # Reconstruct model from aggregated deltas
+            with torch.no_grad():
+                if new_ae is not None:
+                    for k, p in global_model.autoencoder.named_parameters():
+                        p.copy_(g_ae_w[k] + new_ae[k])
+                if new_head is not None:
+                    for k, p in global_model.attack_head.named_parameters():
+                        p.copy_(g_head_w[k] + new_head[k])
+            
+            new_arrays = [p.detach().cpu().numpy() for p in global_model.parameters()]
+            
+            flagged_indices = [i for i, c in enumerate(classifications) if 'BYZANTINE' in c]
+            
+            for idx in range(num_clients):
+                print(f"  [{mode}] Client {idx:2d} [{roles[idx]:10s}] ch1={ch1_scores[idx]:.4f} ch2={ch2_scores[idx] if ch2_scores[idx] is not None else 0.0:.4f} -> {classifications[idx]}")
                 
-                for idx in range(num_clients):
-                    print(f"  [DC-FLTrust] Client {idx:2d} [{roles[idx]:10s}] ch1={ch1_scores[idx]:.4f} ch2={ch2_scores[idx] if ch2_scores[idx] is not None else 0.0:.4f} -> {classifications[idx]}")
-                    
-                if attack_ref_buffer is not None:
-                    print(f"  [DC-FLTrust] Buffer size: {len(attack_ref_buffer._buffer)}")
-            else:
-                new_arrays, trust_scores, flagged_indices = fltrust_aggregate(
-                    global_model   = global_model,
-                    client_updates = client_updates,
-                    root_data      = root_data,
-                    server_lr      = cfg.FLTRUST_SERVER_LR,
-                    min_trust      = cfg.FLTRUST_MIN_TRUST_SCORE,
-                )
-            print(f"\n  [FLTrust] Per-Client Trust Scores (cosine vs server root gradient):")
+            if attack_ref_buffer is not None:
+                print(f"  [DC-FLTrust] Buffer size: {len(attack_ref_buffer._buffer)}")
+                
+            print(f"\n  [{mode}] Per-Client Trust Scores:")
             for idx, trust in enumerate(trust_scores):
                 flag = "[BYZANTINE SUSPECT]" if idx in flagged_indices else "[trusted         ]"
                 print(
-                    f"  [FLTrust] Client {idx:2d} [{roles[idx]:10s}]  "
+                    f"  [{mode}] Client {idx:2d} [{roles[idx]:10s}]  "
                     f"trust={trust:.4f}  {flag}"
                 )
             print(
-                f"\n  [FLTrust] Flagged Byzantine: {flagged_indices}  "
+                f"\n  [{mode}] Flagged Byzantine: {flagged_indices}  "
                 f"(expected adversarial clients: {list(range(num_byzantine))})"
             )
             if rare_client:
@@ -530,9 +598,24 @@ def main():
     import argparse
     import random
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="single_channel", choices=["single_channel", "dual_channel"])
-    parser.add_argument("--rounds", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        '--mode',
+        choices=['ae_only', 'joint_dual', 'dc_fltrust'],
+        default='dc_fltrust',
+        help=(
+            'ae_only: AE-only FLTrust baseline (Mode A) — '
+            'no AttackHead federation. '
+            'joint_dual: combined ch1+ch2 trust score (Mode B) — '
+            'both channels evaluated but not disambiguated. '
+            'dc_fltrust: full DC-FLTrust with disambiguation (Mode C).'
+        )
+    )
+    parser.add_argument('--rounds', type=int, default=10)
+    parser.add_argument('--attack-mode',
+        choices=['none', 'latent_inversion', 'true_labelflip'],
+        default='none'
+    )
+    parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -545,7 +628,7 @@ def main():
     
     num_clients = 5
     ratio = 0.2  # 1 byzantine client
-    run_experiment("FLTrust", num_clients, byzantine_ratio=ratio, mode=args.mode, num_rounds=args.rounds)
+    run_experiment("FLTrust", num_clients, byzantine_ratio=ratio, mode=args.mode, num_rounds=args.rounds, attack_mode=args.attack_mode)
 
     print("\n" + "=" * 70)
     print("  Byzantine Benchmark Complete.")
