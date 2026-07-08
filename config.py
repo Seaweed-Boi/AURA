@@ -173,7 +173,7 @@ FL_ROOT_DATA_SOURCE = "real"
 # These are used to train the server model by one step each round so it computes
 # a reference gradient direction for cosine trust scoring of client updates.
 # Range: 100–500 recommended; lower = faster, higher = more robust server gradient.
-FLTRUST_ROOT_SAMPLES   = 200
+FLTRUST_ROOT_SAMPLES   = 2000
 
 # Learning rate used for the server's single-step root-dataset gradient update.
 # Kept separate from AE_LEARNING_RATE so it can be tuned independently.

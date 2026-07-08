@@ -259,6 +259,137 @@ def _retrain_reference_head(head, z_tensor, epochs=3):
         opt.step()
     head.eval()
 
+def ae_only_fltrust_aggregate(
+    client_ae_deltas: list,
+    root_ae_delta: dict,
+) -> tuple:
+    """
+    AE-Only FLTrust (Mode A baseline).
+    
+    Only AE gradients are transmitted and evaluated.
+    AttackHead does not exist in this mode.
+    This is the pre-DC-FLTrust baseline — federate only the AE,
+    ignore attack-pattern knowledge entirely.
+    
+    Returns: (aggregated_ae_weights, trust_scores)
+    """
+    def flatten(delta: dict) -> torch.Tensor:
+        return torch.cat([v.flatten().float() for v in delta.values()])
+    
+    root_flat = flatten(root_ae_delta)
+    trust_scores = []
+    
+    for ae_delta in client_ae_deltas:
+        client_flat = flatten(ae_delta)
+        sim = F.cosine_similarity(
+            client_flat.unsqueeze(0),
+            root_flat.unsqueeze(0)
+        ).item()
+        trust_scores.append(max(0.0, sim))  # ReLU
+    
+    # Normalize
+    total = sum(trust_scores)
+    if total > 0:
+        normalized = [s / total for s in trust_scores]
+    else:
+        normalized = [1.0 / len(trust_scores)] * len(trust_scores)
+    
+    # Weighted aggregation
+    agg_ae = {
+        k: sum(w * d[k] for w, d in zip(normalized, client_ae_deltas))
+        for k in client_ae_deltas[0]
+    }
+    
+    return agg_ae, trust_scores
+
+
+def joint_dual_fltrust_aggregate(
+    client_ae_deltas: list,
+    client_head_deltas: list,
+    root_ae_delta: dict,
+    root_head_delta: dict,
+    client_round_counts: list,
+    ch2_warmup_rounds: int = 10,
+    ch1_weight: float = 0.7,
+) -> tuple:
+    """
+    Joint Dual-Channel FLTrust (Mode B baseline).
+    
+    Both AE and AttackHead gradients evaluated independently,
+    but COMBINED into a single trust weight before aggregation:
+    trust = ch1_weight * ch1 + (1 - ch1_weight) * ch2
+    
+    A client with honest AE (ch1=0.8) but corrupted AttackHead (ch2=0.1)
+    receives trust = 0.7*0.8 + 0.3*0.1 = 0.59 — reduced but NOT excluded.
+    The corrupted AttackHead gradient still enters global aggregation
+    at 59% weight rather than the 80% it would receive if AE-only.
+    
+    This is the key difference from DC-FLTrust (Mode C):
+    Mode B reduces but does not eliminate corrupted gradient influence.
+    Mode C detects BYZANTINE_FAKE_ATTACK and excludes the head gradient entirely.
+    
+    Returns: (aggregated_ae, aggregated_head, combined_trust_scores, ch1_scores, ch2_scores)
+    """
+    def flatten(delta: dict) -> torch.Tensor:
+        return torch.cat([v.flatten().float() for v in delta.values()])
+    
+    root_ae_flat = flatten(root_ae_delta)
+    root_head_flat = flatten(root_head_delta)
+    
+    ch1_scores = []
+    ch2_scores = []
+    combined_scores = []
+    
+    for ae_delta, head_delta, rounds in zip(
+        client_ae_deltas, client_head_deltas, client_round_counts
+    ):
+        ch1 = max(0.0, F.cosine_similarity(
+            flatten(ae_delta).unsqueeze(0),
+            root_ae_flat.unsqueeze(0)
+        ).item())
+        
+        if rounds >= ch2_warmup_rounds and head_delta is not None:
+            ch2 = max(0.0, F.cosine_similarity(
+                flatten(head_delta).unsqueeze(0),
+                root_head_flat.unsqueeze(0)
+            ).item())
+        else:
+            ch2 = 0.0  # warmup — treat as no attack signal
+        
+        combined = ch1_weight * ch1 + (1 - ch1_weight) * ch2
+        
+        ch1_scores.append(ch1)
+        ch2_scores.append(ch2)
+        combined_scores.append(combined)
+    
+    # Normalize combined scores
+    total = sum(combined_scores)
+    if total > 0:
+        normalized = [s / total for s in combined_scores]
+    else:
+        normalized = [1.0 / len(combined_scores)] * len(combined_scores)
+    
+    # Both channels aggregated with same combined weight
+    # This is the flaw: corrupted head gradients enter aggregation
+    # at the same weight as honest AE gradients
+    agg_ae = {
+        k: sum(w * d[k] for w, d in zip(normalized, client_ae_deltas))
+        for k in client_ae_deltas[0]
+    }
+    
+    valid_heads = [(w, d) for w, d in zip(normalized, client_head_deltas)
+                   if d is not None]
+    if valid_heads:
+        agg_head = {
+            k: sum(w * d[k] for w, d in valid_heads)
+            for k in valid_heads[0][1]
+        }
+    else:
+        agg_head = None
+    
+    return agg_ae, agg_head, combined_scores, ch1_scores, ch2_scores
+
+
 def dc_fltrust_aggregate(
     client_ae_deltas: list,
     client_head_deltas: list,
@@ -306,27 +437,36 @@ def dc_fltrust_aggregate(
         ch1 = cosine_trust(flatten(ae_delta), root_ae_flat)
         
         # Channel 2: gated by warmup
-        if rounds >= ch2_warmup_rounds and head_delta is not None:
-            ch2 = cosine_trust(flatten(head_delta), root_head_flat)
+        if rounds >= ch2_warmup_rounds:
+            if head_delta is not None:
+                ch2 = cosine_trust(flatten(head_delta), root_head_flat)
+            else:
+                ch2 = None  # No attack signal submitted
         else:
-            ch2 = None  # warmup — not yet scored
+            ch2 = 'WARMUP'  # Special flag for warmup
         
         ch1_scores.append(ch1)
-        ch2_scores.append(ch2)
+        ch2_scores.append(ch2 if isinstance(ch2, float) else 0.0)
         
         # Classify client based on dual-channel scores
-        if ch2 is None:
+        if ch2 == 'WARMUP':
             classification = 'WARMUP'
-        elif ch1 > 0.5 and (ch2 is None or ch2 < 0.3):
-            classification = 'HEALTHY'
-        elif ch1 > 0.5 and ch2 > 0.5:
-            classification = 'UNDER_ATTACK'
-        elif ch1 < 0.3 and ch2 > 0.5:
-            classification = 'BYZANTINE_FAKE_ATTACK'
-        elif ch1 < 0.3 and ch2 < 0.3:
-            classification = 'BYZANTINE'
+        elif ch2 is None:
+            # Client past warmup but didn't submit a head (no attacks seen)
+            if ch1 > 0.5:
+                classification = 'HEALTHY'
+            else:
+                classification = 'BYZANTINE'
         else:
-            classification = 'AMBIGUOUS'
+            # Client submitted a head delta
+            if ch1 > 0.5 and ch2 > 0.5:
+                classification = 'UNDER_ATTACK'
+            elif ch1 > 0.5 and ch2 <= 0.5:
+                classification = 'BYZANTINE_FAKE_ATTACK'
+            elif ch1 <= 0.5 and ch2 > 0.5:
+                classification = 'BYZANTINE_FAKE_ATTACK'
+            else:
+                classification = 'BYZANTINE'
         
         classifications.append(classification)
     
@@ -367,8 +507,8 @@ def dc_fltrust_aggregate(
     
     # Aggregate head weights — only from clients with active ch2 and not Byzantine
     ch2_weights = torch.tensor([
-        (s if s is not None else 0.0)
-        if c not in ('BYZANTINE', 'WARMUP') else 0.0
+        (s if s is not None and isinstance(s, float) else 0.0)
+        if c not in ('BYZANTINE', 'BYZANTINE_FAKE_ATTACK', 'WARMUP') else 0.0
         for s, c in zip(ch2_scores, classifications)
     ])
     ch2_norm = ch2_weights.sum()
@@ -381,12 +521,12 @@ def dc_fltrust_aggregate(
     
     active_head_updates = [
         (w, d) for w, d, c in zip(ch2_weights, client_head_deltas, classifications)
-        if c not in ('BYZANTINE', 'WARMUP') and d is not None
+        if c not in ('BYZANTINE', 'BYZANTINE_FAKE_ATTACK', 'WARMUP') and d is not None
     ]
     
     if active_head_updates:
         agg_head = {k: sum(w * d[k] for w, d in active_head_updates)
-                    for k in client_head_deltas[0]}
+                    for k in active_head_updates[0][1]}
     else:
         agg_head = None  # no head update this round
     
