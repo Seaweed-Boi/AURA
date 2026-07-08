@@ -418,6 +418,9 @@ def main():
 
             # Write recommended values to a JSON file for easy reference
             import json
+            p75 = float(np.percentile(mse_values, 75))
+            p99_5 = float(np.percentile(mse_values, 99.5))
+            
             results = {
                 "n_samples":              int(len(mse_values)),
                 "mse_min":                float(mse_values.min()),
@@ -425,16 +428,20 @@ def main():
                 "mse_max":                float(mse_values.max()),
                 "mse_std":                float(mse_values.std()),
                 "p50":                    float(np.percentile(mse_values, 50)),
-                "p75":                    float(np.percentile(mse_values, 75)),
+                "p75":                    round(p75, 7),
                 "p90":                    float(np.percentile(mse_values, 90)),
                 "p95":                    float(np.percentile(mse_values, 95)),
                 "p99":                    float(np.percentile(mse_values, 99)),
-                "p99_5":                  float(np.percentile(mse_values, 99.5)),
+                "p99_5":                  round(p99_5, 7),
                 "p99_9":                  float(np.percentile(mse_values, 99.9)),
                 "recommended_MSE_THRESHOLD_MEDIUM": round(p90, 4),
                 "recommended_MSE_THRESHOLD_HIGH":   round(p99, 4),
                 "current_MSE_THRESHOLD_MEDIUM":     cfg.MSE_THRESHOLD_MEDIUM,
                 "current_MSE_THRESHOLD_HIGH":       cfg.MSE_THRESHOLD_HIGH,
+                "MSE_THRESHOLD_MEDIUM":   round(float(p90), 7),
+                "MSE_THRESHOLD_HIGH":     round(float(p99), 7),
+                "MSE_THRESHOLD_HIGH_CONSERVATIVE": round(p99_5, 7),
+                "CH2_MSE_SPLIT_THRESHOLD": round(p75, 7),
             }
             out_path = cfg.LOGS_DIR / "calibration_results.json"
             with open(out_path, "w") as f:

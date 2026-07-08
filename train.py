@@ -199,18 +199,11 @@ def main():
     loader = CICIDSDataLoader(load_fraction=0.15 if args.quick else cfg.DATA_LOAD_FRACTION)
     scaler = loader.fit_scaler()
 
-    # ── Step 2: Collect ALL benign flows into a flat tensor  ─────────────────
-    print("[Phase 2] Collecting benign training data …")
-    benign_flows = []
-    attack_graphs_for_gnn = []
-
-    # Use NF-UNSW-NB15-v3 (single CSV); benign flows filtered by Label==0
+    # ── Step 2: Collect ALL windows for canonical split ──────────────────────
+    print("[Phase 2] Streaming all windows and computing canonical split …")
+    all_windows = []
     for graph, labels in loader.stream_graphs(scaler, csv_files=[CSV_FILES[0]]):
-        # Collect benign flow features for AE baseline training
-        benign_flows.append(graph["edge_attr"])
-
-        if len(attack_graphs_for_gnn) < 100:
-            attack_graphs_for_gnn.append((graph, labels))
+        all_windows.append((graph, labels))
 
         if len(benign_flows) >= 50:  # Cap for speed during hackathon
             break
@@ -220,17 +213,20 @@ def main():
         sys.exit(1)
 
     all_benign = torch.cat(benign_flows, dim=0)   # [N_total, F]
-    logger.info(f"Total benign flows collected: {all_benign.shape[0]}")
+    logger.info(f"Total benign flows collected (train windows only): {all_benign.shape[0]}")
 
-    # Train/val split (80/20)
-    n_val      = int(len(all_benign) * 0.20)
-    n_train    = len(all_benign) - n_val
-    train_data, val_data = random_split(
-        all_benign, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
-    train_tensor = all_benign[list(train_data.indices)]
-    val_tensor   = all_benign[list(val_data.indices)]
+    # Extract mixed graphs (benign + attack) from train windows for the GNN
+    attack_graphs_for_gnn = []
+    for graph, labels in train_windows:
+        attack_graphs_for_gnn.append((graph, labels))
+        if len(attack_graphs_for_gnn) >= 100:  # Cap at 100 graphs for speed
+            break
+
+    # Val split: chronological last 20% of the train-window benign flows
+    n_val   = int(len(all_benign) * 0.20)
+    n_train = len(all_benign) - n_val
+    train_tensor = all_benign[:n_train]
+    val_tensor   = all_benign[n_train:]
 
     # ── Step 3: Train Autoencoder ────────────────────────────────────────────
     print("[Phase 3] Training FlowAutoencoder …")

@@ -80,6 +80,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as cfg
 from aura.models import AURAModelBundle
 
+from config import preflight_dc_fltrust_check
+preflight_dc_fltrust_check()
+
 logger = logging.getLogger(__name__)
 
 
@@ -243,6 +246,156 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
 # ─────────────────────────────────────────────────────────────────────────────
 # FLTrust Aggregation (Upgrade 6 — active path in aggregate_fit; Krum is legacy fallback only)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _retrain_reference_head(head, z_tensor, epochs=3):
+    """Retrain the server's reference AttackHead on the latest dynamic z buffer."""
+    import torch.optim as optim
+    import torch.nn.functional as F
+    opt = optim.Adam(head.parameters(), lr=1e-3)
+    head.train()
+    for _ in range(epochs):
+        opt.zero_grad()
+        preds = head(z_tensor).squeeze()
+        # Pseudo-label 1.0 because this is a confirmed attack buffer
+        pseudo_labels = torch.ones_like(preds)
+        loss = F.binary_cross_entropy(preds, pseudo_labels)
+        loss.backward()
+        opt.step()
+    head.eval()
+
+def dc_fltrust_aggregate(
+    client_ae_deltas: list,
+    client_head_deltas: list,
+    root_ae_delta: dict,
+    root_head_delta: dict,
+    client_round_counts: list,
+    ch2_warmup_rounds: int = 10,
+    round_z_submissions: dict = None,
+    attack_ref_buffer = None,
+    current_round: int = 0,
+    reference_attack_head = None
+) -> tuple:
+    """
+    Dual-channel FLTrust aggregation.
+    
+    Channel 1: cosine similarity of AE delta vs root AE delta
+    Channel 2: cosine similarity of AttackHead delta vs root head delta
+               Only active after ch2_warmup_rounds per client
+    
+    Returns: (aggregated_ae_weights, aggregated_head_weights, 
+               ch1_scores, ch2_scores, classifications)
+    """
+    
+    def flatten(delta: dict) -> torch.Tensor:
+        return torch.cat([v.flatten() for v in delta.values()])
+    
+    def cosine_trust(client_flat, root_flat) -> float:
+        sim = F.cosine_similarity(
+            client_flat.unsqueeze(0), 
+            root_flat.unsqueeze(0)
+        ).item()
+        return max(0.0, sim)  # ReLU — negative similarity → zero trust
+    
+    root_ae_flat = flatten(root_ae_delta)
+    root_head_flat = flatten(root_head_delta)
+    
+    ch1_scores = []
+    ch2_scores = []
+    classifications = []
+    
+    for i, (ae_delta, head_delta, rounds) in enumerate(
+        zip(client_ae_deltas, client_head_deltas, client_round_counts)
+    ):
+        # Channel 1: always active
+        ch1 = cosine_trust(flatten(ae_delta), root_ae_flat)
+        
+        # Channel 2: gated by warmup
+        if rounds >= ch2_warmup_rounds and head_delta is not None:
+            ch2 = cosine_trust(flatten(head_delta), root_head_flat)
+        else:
+            ch2 = None  # warmup — not yet scored
+        
+        ch1_scores.append(ch1)
+        ch2_scores.append(ch2)
+        
+        # Classify client based on dual-channel scores
+        if ch2 is None:
+            classification = 'WARMUP'
+        elif ch1 > 0.5 and (ch2 is None or ch2 < 0.3):
+            classification = 'HEALTHY'
+        elif ch1 > 0.5 and ch2 > 0.5:
+            classification = 'UNDER_ATTACK'
+        elif ch1 < 0.3 and ch2 > 0.5:
+            classification = 'BYZANTINE_FAKE_ATTACK'
+        elif ch1 < 0.3 and ch2 < 0.3:
+            classification = 'BYZANTINE'
+        else:
+            classification = 'AMBIGUOUS'
+        
+        classifications.append(classification)
+    
+    # Aggregate AE weights — exclude Byzantine clients from ch1
+    ch1_weights = torch.tensor([
+        s if c not in ('BYZANTINE', 'BYZANTINE_FAKE_ATTACK') else 0.0
+        for s, c in zip(ch1_scores, classifications)
+    ])
+    ch1_norm = ch1_weights.sum()
+    if ch1_norm > 0:
+        ch1_weights = ch1_weights / ch1_norm
+    
+    # === Attack Reference Buffer Update ===
+    if round_z_submissions is not None and attack_ref_buffer is not None:
+        for client_id, classification in enumerate(classifications):
+            if classification == 'UNDER_ATTACK':
+                if client_id < len(round_z_submissions) and round_z_submissions[client_id] is not None:
+                    z_submission = round_z_submissions[client_id]
+                    if len(z_submission) > 0:
+                        if isinstance(z_submission, list):
+                            z_submission = torch.cat(z_submission)
+                        attack_ref_buffer.update(
+                            z_submission, 
+                            round_num=current_round
+                        )
+        
+        if attack_ref_buffer.is_ready():
+            new_reference = attack_ref_buffer.get_reference_tensor()
+            if reference_attack_head is not None:
+                _retrain_reference_head(reference_attack_head, new_reference)
+                channel2_reference = reference_attack_head
+            logger.info(f"Round {current_round}: ch2 reference updated from buffer "
+                        f"({attack_ref_buffer.stats()['buffer_size']} vectors)")
+        else:
+            logger.info(f"Round {current_round}: buffer not ready "
+                        f"({len(attack_ref_buffer._buffer)}/{attack_ref_buffer.min_size_to_use}), "
+                        f"using static reference")
+    
+    # Aggregate head weights — only from clients with active ch2 and not Byzantine
+    ch2_weights = torch.tensor([
+        (s if s is not None else 0.0)
+        if c not in ('BYZANTINE', 'WARMUP') else 0.0
+        for s, c in zip(ch2_scores, classifications)
+    ])
+    ch2_norm = ch2_weights.sum()
+    if ch2_norm > 0:
+        ch2_weights = ch2_weights / ch2_norm
+    
+    # Weighted aggregation
+    agg_ae = {k: sum(w * d[k] for w, d in zip(ch1_weights, client_ae_deltas))
+              for k in client_ae_deltas[0]}
+    
+    active_head_updates = [
+        (w, d) for w, d, c in zip(ch2_weights, client_head_deltas, classifications)
+        if c not in ('BYZANTINE', 'WARMUP') and d is not None
+    ]
+    
+    if active_head_updates:
+        agg_head = {k: sum(w * d[k] for w, d in active_head_updates)
+                    for k in client_head_deltas[0]}
+    else:
+        agg_head = None  # no head update this round
+    
+    return agg_ae, agg_head, ch1_scores, ch2_scores, classifications
+
 
 def fltrust_aggregate(
     global_model:    AURAModelBundle,
@@ -848,7 +1001,7 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="AURA FL Aggregation Server")
+    parser = argparse.ArgumentParser(description="AURA FL Server (FLTrust)")
     parser.add_argument(
         "--address", default=cfg.FL_SERVER_ADDRESS,
         help="gRPC bind address (default: %(default)s). "
