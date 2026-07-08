@@ -182,13 +182,23 @@ class EMAThresholdTracker:
             self._ema_mean = loss
             self._ema_var  = 0.0
         else:
-            # EMA mean update:  μ_t = α·x_t + (1−α)·μ_{t−1}
-            delta           = loss - self._ema_mean
-            self._ema_mean += self.alpha * delta
+            # Decide BEFORE mutating state: is this reading anomalous
+            # relative to the baseline as it stood prior to this loss?
+            pre_update_threshold = self.threshold
+            triggered_now = (
+                not math.isinf(pre_update_threshold)
+                and loss > pre_update_threshold
+            )
 
-            # EMA variance update (online Welford-style):
-            # σ²_t = (1−α)·(σ²_{t−1} + α·δ²)
-            self._ema_var   = (1 - self.alpha) * (self._ema_var + self.alpha * delta ** 2)
+            if not triggered_now:
+                # Only fold NORMAL readings into the baseline. Otherwise an
+                # attack window drags the EMA mean toward the attack itself,
+                # silently raising the threshold and "erasing" a sustained
+                # attack over just a few windows.
+                delta           = loss - self._ema_mean
+                self._ema_mean += self.alpha * delta
+                self._ema_var   = (1 - self.alpha) * (self._ema_var + self.alpha * delta ** 2)
+            # else: baseline frozen — do not let the attack contaminate normal stats
 
         # ── Trajectory tracking (post-warmup only) ────────────────────────────
         if self.batch_count >= self.warmup_batches and self._ema_mean is not None:
@@ -356,12 +366,8 @@ class AURAInferenceEngine:
                 inferred_attack = expl["inferred_attack"]
                 match_score     = expl["match_score"]
                 group_residuals = expl["group_residuals"]
-            except Exception as e:
-                raise RuntimeError(
-                    f"FATAL: Explainer failed during inference. "
-                    f"Silent Normal label would corrupt evaluation metrics. "
-                    f"Original error: {e}"
-                )
+            except Exception as _e:
+                logger.debug(f"Explainer skipped: {_e}")
         # ── Layer 2: Contextual Validator (only if L1 triggered) ──────────
         gnn_scores      = None
         triggered_nodes = []

@@ -134,7 +134,7 @@ Pass updated `edge_index` into the GraphSAGE forward call each epoch. Do not cac
 **Goal:** Train a Generator to produce synthetic adversarial NetFlow sequences. Adversarially train the autoencoder against them to tighten anomaly detection boundaries.
 
 **Architecture:**
-- Generator: 3-layer MLP. Input: latent noise vector (dim=32). Output: synthetic NetFlow feature vector (dim=47). # Updated from 78: actual FEATURE_DIM=47 per config.py.
+- Generator: 3-layer MLP. Input: latent noise vector (dim=32). Output: synthetic NetFlow feature vector (dim=78).
 - Discriminator: The existing autoencoder's encoder half. Freeze decoder during GAN training phase.
 
 **Training procedure:**
@@ -220,8 +220,8 @@ NETFLOW_FEATURE_NAMES = [
 
 def explain_anomaly(original_features, reconstructed_features, top_n=5):
     """
-    original_features: numpy array shape (47,) # Updated from 78: actual FEATURE_DIM=47 per config.py.
-    reconstructed_features: numpy array shape (47,) # Updated from 78: actual FEATURE_DIM=47 per config.py.
+    original_features: numpy array shape (78,)
+    reconstructed_features: numpy array shape (78,)
     Returns dict with top contributing features and their error magnitude.
     """
     per_feature_error = (original_features - reconstructed_features) ** 2

@@ -267,7 +267,21 @@ def run_experiment(
     num_clients     : Total clients in the federation (10)
     byzantine_ratio : Fraction of clients that are adversarial (0.1 to 0.4)
     rare_client     : If True, last client gets shifted-but-benign distribution
+    seed            : If set, fixes torch/numpy RNG so runs are comparable
+                       across strategies/ratios (needed for divergence metric).
+
+    Returns
+    -------
+    dict with keys: strategy, byzantine_ratio, num_byzantine, roles,
+    flagged_indices (clients this strategy excluded/flagged, empty for
+    FedAvg since it has no defense), tp/fp/fn/tn and balanced_accuracy for
+    Byzantine-client detection, final_arrays (the resulting global model
+    weights, for computing divergence against a clean baseline), model_hash.
     """
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
     logger.info("\n" + "=" * 60)
     logger.info(
         f"Running {strategy_name} | Byzantine Ratio: {byzantine_ratio*100:.0f}% "
@@ -416,6 +430,7 @@ def run_experiment(
                 f"  [FedAvg] All {num_clients} clients contributed equally -- "
                 f"including {num_byzantine} Byzantine (NO FILTER)."
             )
+            flagged_indices = []  # FedAvg has no defense -- never flags anyone
 
         elif strategy_name == "Krum":
             # Distance-based Krum selection
@@ -424,6 +439,7 @@ def run_experiment(
             selected_updates = [client_updates[i] for i in selected_indices]
             new_arrays       = krum_aggregate(selected_updates)
             dropped          = [i for i in range(num_clients) if i not in selected_indices]
+            flagged_indices  = dropped  # unify naming with FLTrust's flagged_indices
             print(f"\n  [Krum] Selected: {selected_indices} | Dropped: {dropped}")
             for i in dropped:
                 print(f"  [Krum] WARNING: Client {i:2d} [{roles[i]}] DROPPED (high Euclidean distance from cluster)")
@@ -524,6 +540,39 @@ def run_experiment(
     model_hash = "0x" + h.hexdigest()
     print(f"\n  [{strategy_name} | {byzantine_ratio*100:.0f}% Byzantine] Final Model SHA-256: {model_hash}")
     logger.info(f"Finished {strategy_name} | {byzantine_ratio*100:.0f}% Byzantine simulation.")
+
+    # ── Byzantine-detection accuracy ─────────────────────────────────────
+    # TP: byzantine client correctly flagged/dropped
+    # FP: benign (or rare) client incorrectly flagged/dropped
+    # FN: byzantine client missed
+    # TN: benign client correctly left alone
+    true_byzantine = set(i for i in range(num_clients) if roles[i] == "byzantine")
+    flagged        = set(flagged_indices)
+    non_byzantine  = set(range(num_clients)) - true_byzantine
+
+    tp = len(true_byzantine & flagged)
+    fn = len(true_byzantine - flagged)
+    fp = len(non_byzantine & flagged)
+    tn = len(non_byzantine - flagged)
+
+    tpr = tp / len(true_byzantine) if true_byzantine else float("nan")
+    tnr = tn / len(non_byzantine) if non_byzantine else float("nan")
+    balanced_accuracy = (
+        (tpr + tnr) / 2 if not (np.isnan(tpr) or np.isnan(tnr)) else float("nan")
+    )
+
+    return {
+        "strategy": strategy_name,
+        "byzantine_ratio": byzantine_ratio,
+        "num_byzantine": num_byzantine,
+        "roles": roles,
+        "flagged_indices": sorted(flagged),
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "tpr": tpr, "tnr": tnr,
+        "balanced_accuracy": balanced_accuracy,
+        "final_arrays": global_arrays,
+        "model_hash": model_hash,
+    }
 
 
 def main():

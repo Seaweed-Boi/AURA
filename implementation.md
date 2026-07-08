@@ -101,7 +101,7 @@ TRINETRA---NEXJEM/
 
 ### Class: `CICIDSDataLoader`
 
-**Dataset:** CICIDS2017 `MachineLearningCSV` variant — 47 NetFlow statistical features per row. **The IP columns are stripped** by the dataset provider; we never have real src/dst IPs. # Updated from 78: actual FEATURE_DIM=47 per config.py.
+**Dataset:** CICIDS2017 `MachineLearningCSV` variant — 78 NetFlow statistical features per row. **The IP columns are stripped** by the dataset provider; we never have real src/dst IPs.
 
 ### Processing Chain (in order)
 
@@ -134,9 +134,9 @@ Each `(src, dst)` edge has a TTL counter. Active edges reset to `EDGE_TTL_WINDOW
 ### Output Format
 ```python
 graph_dict = {
-    "x":          FloatTensor[N=20, F=47],   # Per-node mean feature vectors # Updated from 78: actual FEATURE_DIM=47 per config.py.
+    "x":          FloatTensor[N=20, F=78],   # Per-node mean feature vectors
     "edge_index": LongTensor[2, E],           # COO sparse adjacency (post-TTL)
-    "edge_attr":  FloatTensor[E, F=47],       # Per-edge (flow) features # Updated from 78: actual FEATURE_DIM=47 per config.py.
+    "edge_attr":  FloatTensor[E, F=78],       # Per-edge (flow) features
     "ttl_state":  dict,                       # {(src,dst): ttl_remaining} for UI
     "window_id":  str,                        # "filename:wN" for tracing
 }
@@ -164,7 +164,7 @@ Monday CSV is pure benign and is the scaler-fit target. All others contain attac
 
 ### Layer 1: `FlowAutoencoder` — Statistical Tripwire
 
-**Input:** Edge (flow) feature vectors `[E, F=47]`  # Updated from 78: actual FEATURE_DIM=47 per config.py.
+**Input:** Edge (flow) feature vectors `[E, F=78]`  
 **Architecture:**
 ```
 Encoder: F → 64 → 32 → Z=16      (Dropout 0.2, ReLU, no activation on bottleneck)
@@ -183,10 +183,10 @@ The contrastive term pushes attack latents away from the normal manifold, sharpe
 
 ### Layer 2: `AuraSTGNN` — Contextual Validator
 
-**Input:** Node feature matrix `[N=20, F=47]` from `_build_node_features` + `edge_index [2, E]`  # Updated from 78: actual FEATURE_DIM=47 per config.py.
+**Input:** Node feature matrix `[N=20, F=78]` from `_build_node_features` + `edge_index [2, E]`  
 **Architecture:**
 ```
-SAGEConv(47 → 64) → Dropout(0.3) → SAGEConv(64 → 32) → Linear(32→16) → ReLU → Linear(16→1) → Sigmoid
+SAGEConv(78 → 64) → Dropout(0.3) → SAGEConv(64 → 32) → Linear(32→16) → ReLU → Linear(16→1) → Sigmoid
 ```
 **Output:** Per-node anomaly probability `[N]` ∈ (0, 1)
 
@@ -292,7 +292,7 @@ If L2 was not invoked (GNN scores = None), L1 carries 100% weight.
 ### Purpose
 When Layer 1 fires, the explainer answers: *which features caused the anomaly, and what attack does this look like?*
 
-### `explain_ae(residuals: np.ndarray[47]) → dict` # Updated from 78: actual FEATURE_DIM=47 per config.py.
+### `explain_ae(residuals: np.ndarray[78]) → dict`
 1. **Top-K features:** Sorts `|x - x_hat|` descending, maps index → human-readable CICIDS feature name.
 2. **Group residuals:** Aggregates residuals across 7 semantic groups (Volume, Bandwidth, Timing/IAT, TCP Flags, Idle/Active, Bulk Transfer, Window/Segment).
 3. **Attack signature matching:** Cosine similarity between the normalised residual vector and 5 pre-defined sparse attack signature vectors.
@@ -490,7 +490,7 @@ All constants live here. **Do not hardcode values in operational scripts.**
 | `DATA_LOAD_FRACTION` | 0.30 | 30% of rows per CSV (reduce for speed) |
 | `WINDOW_SIZE` | 60 | Rows per graph snapshot |
 | `EDGE_TTL_WINDOWS` | 3 | Windows before edge pruned |
-| `FEATURE_DIM` | 47 | NetFlow feature count | # Updated from 78: actual FEATURE_DIM=47 per config.py.
+| `FEATURE_DIM` | 78 | NetFlow feature count |
 | `LATENT_DIM` | 16 | AE bottleneck size |
 | `AE_EPOCHS` | 30 | Standard training epochs |
 | `AE_BATCH_SIZE` | 256 | |
@@ -517,7 +517,7 @@ These are non-negotiable constraints. Violating them will break the system's cor
 
 ### ML Architecture
 - **`torch_geometric` is NOT used.** GraphSAGE is implemented via `torch.scatter_add_` in `models.py`. Do not introduce `torch_geometric` as a dependency.
-- **`FEATURE_DIM=47` is fixed** by the CICIDS2017 dataset. If you ever change the feature count, you must retrain both models from scratch and update all saved `.pth` files. # Updated from 78: actual FEATURE_DIM=47 per config.py.
+- **`FEATURE_DIM=78` is fixed** by the CICIDS2017 dataset. If you ever change the feature count, you must retrain both models from scratch and update all saved `.pth` files.
 - **The `AURAModelBundle` wraps both models.** Federation passes this bundle as a unit. Never federating only one sub-model without the other will desynchronise the system.
 
 ### Data Pipeline

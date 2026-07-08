@@ -47,10 +47,6 @@ import os
 import sys
 from pathlib import Path
 
-# Force UTF-8 encoding for stdout to prevent crashes when printing emojis on Windows
-if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
-
 import numpy as np
 import torch
 
@@ -68,7 +64,7 @@ log = logging.getLogger("calibrate")
 # ── Constants ─────────────────────────────────────────────────────────────────
 AE_CHECKPOINT = cfg.MODELS_DIR / "autoencoder_best.pth"
 # The primary dataset for this project: NF-UNSW-NB15-v3
-DATASET_CSV   = str(cfg.CSV_DIR / "NF-UNSW-NB15-v3.csv")
+DATASET_CSV   = "NF-UNSW-NB15-v3.csv"
 
 # How many graph windows to sample for calibration (more = better estimate)
 MAX_CALIBRATION_WINDOWS = 200
@@ -236,8 +232,9 @@ def print_mse_report(mse_values: np.ndarray):
         print(f"  ✓  MEDIUM threshold looks reasonable.")
 
     print()
-    print("  ✓ Recommendations saved to logs/calibration_results.json.")
-    print("  config.py will dynamically load these values automatically at runtime.")
+    print("  To apply recommendations, edit config.py lines 217–218:")
+    print(f"    MSE_THRESHOLD_HIGH   = {p99:.4f}")
+    print(f"    MSE_THRESHOLD_MEDIUM = {p90:.4f}")
     print("=" * 70)
 
 
