@@ -299,6 +299,7 @@ class AURAFlowerClient(fl.client.Client):
         # Opacus attaches hooks to the model/optimizer that must be fresh
         # after global weights are loaded.
         self.last_epsilon: float = 0.0
+        self.last_epsilon_head: float = 0.0
         self.dp_enabled = (
             cfg.DP_ENABLED
             and OPACUS_AVAILABLE
@@ -398,6 +399,7 @@ class AURAFlowerClient(fl.client.Client):
         }
         if self.dp_enabled:
             fit_metrics["dp_epsilon"] = float(self.last_epsilon)
+            fit_metrics["dp_epsilon_head"] = float(self.last_epsilon_head)
             fit_metrics["dp_delta"] = float(cfg.DP_DELTA)
             fit_metrics["dp_noise_multiplier"] = float(cfg.DP_NOISE_MULTIPLIER)
 
@@ -461,14 +463,10 @@ class AURAFlowerClient(fl.client.Client):
         the updated weights (incorporating the new attack-learned boundary)
         will be shared with the federation.
 
-        When cfg.DP_ENABLED is True and Opacus is available, the AE optimizer
-        is wrapped with PrivacyEngine for DP-SGD.  This provides formal
-        (ε,δ)-differential privacy guarantees on the training data.
-
-        CRITICAL CONSTRAINT: DP wraps ONLY the AE optimizer.  The AttackHead
-        optimizer (when present in DC-FLTrust two-pass architecture) is NOT
-        wrapped because it trains on AE latent representations / pseudo-labeled
-        high-MSE flows, not on raw private client data.
+        When cfg.DP_ENABLED is True and Opacus is available, both the AE
+        and AttackHead optimizers are wrapped with separate PrivacyEngine
+        instances for DP-SGD.  This provides formal (ε,δ)-differential
+        privacy guarantees on both training passes.
 
         Returns:  (num_training_examples, final_batch_loss)
         """
@@ -542,6 +540,94 @@ class AURAFlowerClient(fl.client.Client):
             )
         else:
             self.last_epsilon = 0.0
+
+        # ── Pass 2: AttackHead (MLP) training with DP on high-MSE z vectors ──
+        head = self.model.attack_head
+        head_privacy_engine = None
+        self.last_epsilon_head = 0.0
+
+        # Use unwrapped AE for inference (no grad, no DP hooks needed)
+        ae_unwrapped = ae._module if hasattr(ae, '_module') else ae
+        ae_unwrapped.eval()
+        with torch.no_grad():
+            recon_all, z_all = ae_unwrapped(self.train_data)
+            mse_per_flow = F.mse_loss(
+                recon_all, self.train_data, reduction='none'
+            ).mean(dim=1)
+
+        mse_split = getattr(
+            cfg, 'CH2_MSE_SPLIT_THRESHOLD', cfg.MSE_THRESHOLD_HIGH
+        )
+        high_mse_mask = mse_per_flow > mse_split
+        n_high_mse = int(high_mse_mask.sum().item())
+
+        if n_high_mse > 0:
+            z_high = z_all[high_mse_mask].detach()
+            mse_weights = mse_per_flow[high_mse_mask].detach()
+            mse_weights = (mse_weights - mse_weights.min()) / \
+                          (mse_weights.max() - mse_weights.min() + 1e-8)
+            pseudo_labels = torch.ones(n_high_mse, device=z_high.device)
+
+            head_dataset = torch.utils.data.TensorDataset(
+                z_high, pseudo_labels, mse_weights
+            )
+            head_loader = torch.utils.data.DataLoader(
+                head_dataset,
+                batch_size=min(cfg.AE_BATCH_SIZE, n_high_mse),
+                shuffle=True,
+            )
+
+            head.train()
+            head_optimizer = torch.optim.Adam(
+                head.parameters(), lr=cfg.AE_LEARNING_RATE
+            )
+
+            if self.dp_enabled:
+                head_privacy_engine = PrivacyEngine()
+                head, head_optimizer, head_loader = \
+                    head_privacy_engine.make_private(
+                        module=head,
+                        optimizer=head_optimizer,
+                        data_loader=head_loader,
+                        noise_multiplier=cfg.DP_NOISE_MULTIPLIER,
+                        max_grad_norm=cfg.DP_MAX_GRAD_NORM,
+                    )
+                logger.info(
+                    f"  [{self.client_id}] DP-SGD attached to AttackHead: "
+                    f"\u03c3={cfg.DP_NOISE_MULTIPLIER}  "
+                    f"C={cfg.DP_MAX_GRAD_NORM}  "
+                    f"n_high_mse={n_high_mse}"
+                )
+
+            for _ep in range(3):
+                for z_batch, lbl_batch, w_batch in head_loader:
+                    head_optimizer.zero_grad()
+                    preds = head(z_batch).squeeze(-1)
+                    loss_head = F.binary_cross_entropy(
+                        preds, lbl_batch, weight=w_batch
+                    )
+                    loss_head.backward()
+                    head_optimizer.step()
+
+            if head_privacy_engine is not None:
+                self.last_epsilon_head = head_privacy_engine.get_epsilon(
+                    delta=cfg.DP_DELTA
+                )
+                logger.info(
+                    f"  [{self.client_id}] AttackHead DP complete. "
+                    f"\u03b5={self.last_epsilon_head:.4f}, \u03b4={cfg.DP_DELTA}"
+                )
+
+            # Unwrap DP-wrapped AttackHead
+            if self.dp_enabled and hasattr(head, '_module'):
+                self.model.attack_head = head._module
+            elif self.dp_enabled:
+                self.model.attack_head = head
+        else:
+            logger.debug(
+                f"  [{self.client_id}] No high-MSE flows "
+                f"(threshold={mse_split:.4f}) \u2014 AttackHead training skipped"
+            )
 
         # Unwrap the DP-wrapped model back to the original autoencoder
         # so that model_to_ndarrays() extracts clean parameter tensors.

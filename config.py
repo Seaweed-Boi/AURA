@@ -217,6 +217,36 @@ ORG_NETWORK_MAP: dict = {
     "retail":     "172.31.0.0/24",
 }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIFFERENTIAL PRIVACY (Opacus DP-SGD)  — Tier 2.1
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# PrivacyEngine wraps the AE optimizer ONLY.  The AttackHead optimizer (when
+# present in the DC-FLTrust two-pass architecture) is intentionally excluded
+# because it trains on AE latent representations, not on raw private client
+# data — wrapping it would be architecturally incorrect.
+#
+# Privacy budget semantics:
+#   ε (epsilon)  : privacy loss — lower = stronger privacy, lower utility
+#   δ (delta)    : probability of privacy failure — typically 1/dataset_size
+#   σ (noise_multiplier) : controls ε; higher σ = smaller ε = stronger privacy
+#
+# DP_TARGET_EPSILON is a soft reporting target, NOT an enforced bound.
+# The actual ε is computed by Opacus after training and logged per round.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DP_ENABLED          = True
+DP_MAX_GRAD_NORM    = 1.0    # Per-sample gradient clipping bound (L2 norm clip)
+DP_NOISE_MULTIPLIER = 1.1    # σ — Gaussian noise scale; tune for target ε budget
+DP_DELTA            = 1e-5   # δ — typically set to 1 / training_dataset_size
+DP_TARGET_EPSILON   = 10.0   # Soft reporting target ε; actual ε is computed by Opacus
+
+# Noise multiplier sweep values for Table 3 in the paper.
+# σ=0.0 means no DP noise (baseline); higher σ = more privacy, lower utility.
+# Sweep order: no-DP baseline → weak → moderate → strong → very strong.
+DP_NOISE_SWEEP = [0.0, 0.5, 1.0, 1.5, 2.0]
+
 # Confidence thresholds for the 3-tier response policy
 CONFIDENCE_LOW_THRESHOLD  = 0.40   # Below this: log only
 CONFIDENCE_MED_THRESHOLD  = 0.70   # Below this: throttle + HITL
