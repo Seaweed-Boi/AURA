@@ -54,6 +54,8 @@ import torch.nn.functional as F
 AURA_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(AURA_ROOT))
 
+import config as cfg
+
 FEATURE_DIM  = 47
 ENCODER_DIMS = [32, 24]
 LATENT_DIM   = 16
@@ -155,19 +157,49 @@ def invert_gradient(model, true_grad, steps=200):
 if __name__ == "__main__":
     torch.manual_seed(0)
 
-    global_model = _StandaloneAE()
+    # ── Load the REAL trained AE checkpoint ───────────────────────────────
+    from aura.models import FlowAutoencoder
+    _ckpt_path = AURA_ROOT / "saved_models" / "autoencoder_best.pth"
+    global_model = FlowAutoencoder()
+    try:
+        global_model.load_state_dict(torch.load(_ckpt_path, map_location="cpu"))
+        global_model.eval()
+        print(f"[MITM] Loaded real AE checkpoint: {_ckpt_path}")
+    except Exception as _e:
+        print(f"[MITM] Could not load real checkpoint ({_e}). Using random weights.")
+        global_model = _StandaloneAE()
+        global_model.eval()
 
-    # Simulate 5 org clients (matches FL_MIN_CLIENTS=5 in config.py)
+    # ── Load REAL NF-UNSW-NB15-v3 client partitions ──────────────────────
+    from aura.data_loader import load_client_partition
+
     org_names   = ["hospital", "bank", "university", "isp", "retail"]
-    client_data = [
-        torch.randn(64, FEATURE_DIM, generator=torch.Generator().manual_seed(10+i))
-        for i in range(N_CLIENTS)
-    ]
+    client_data = []
+    for org in org_names:
+        client_id = f"org_{org}_1"
+        X_train, _ = load_client_partition(client_id)
+        # Use first 64 training rows per client (same batch size as before)
+        client_data.append(X_train[:64])
     client_grads = [_get_grad(global_model, d) for d in client_data]
 
-    # Server root dataset (matches FLTRUST_ROOT_SAMPLES=200 in config.py)
-    root_data = torch.randn(200, FEATURE_DIM, generator=torch.Generator().manual_seed(999))
+    # Server root dataset — load real benign partition for FLTrust
+    # Uses the same root data source as fl_server.py
+    from aura.data_loader import CICIDSDataLoader, CSV_FILES
+    _root_loader = CICIDSDataLoader(load_fraction=cfg.DATA_LOAD_FRACTION)
+    _root_scaler = _root_loader.fit_scaler()
+    _root_df = _root_loader._load_csv(CSV_FILES[0])
+    import pandas as pd
+    _label_col = 'Label' if 'Label' in _root_df.columns else cfg.LABEL_COL.strip()
+    if pd.api.types.is_numeric_dtype(_root_df[_label_col]):
+        _benign_df = _root_df[_root_df[_label_col] == cfg.BENIGN_LABEL]
+    else:
+        _benign_df = _root_df[_root_df[_label_col].str.strip().str.upper() == "BENIGN"]
+    _X_root = _root_scaler.transform(
+        _benign_df[_root_loader._feature_cols].values[:cfg.FLTRUST_ROOT_SAMPLES].astype('float32')
+    ).clip(0, 1)
+    root_data = torch.tensor(_X_root, dtype=torch.float32)
     root_grad = _get_grad(global_model, root_data)
+    print(f"[MITM] Root dataset: {len(root_data)} real benign flows for FLTrust")
 
     # ── MODE 1: EAVESDROP ────────────────────────────────────────────────────
     print("\n" + "="*65)
