@@ -32,10 +32,8 @@ import config as cfg
 import torch
 import torch.nn as nn
 import numpy as np
-import torch.nn as nn
-import numpy as np
+import io
 
-from aura.fl_server import fltrust_aggregate, krum_select, krum_aggregate, _build_root_dataset
 from aura.fl_server import fltrust_aggregate, krum_select, krum_aggregate, _build_root_dataset
 from aura.fl_client import AURAFlowerClient
 from aura.data_loader import CICIDSDataLoader, load_client_partition
@@ -50,23 +48,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("byz_bench")
 
 # Force stdout to UTF-8 so Unicode characters render correctly on Windows
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-
-# -----------------------------------------------------------------------------
-# Initialize global scaler once for the entire benchmark run
-# -----------------------------------------------------------------------------
-# Force stdout to UTF-8 so Unicode characters render correctly on Windows
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if not isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 # -----------------------------------------------------------------------------
 # Initialize global scaler once for the entire benchmark run
 # -----------------------------------------------------------------------------
 _loader = CICIDSDataLoader()
 try:
-    _shared_scaler = _loader.fit_scaler()
-    logger.info("Global dataset scaler initialized successfully.")
+    import joblib
+    import os
+    scaler_path = os.path.join(cfg.MODELS_DIR, "scaler.joblib")
+    if os.path.exists(scaler_path):
+        _shared_scaler = joblib.load(scaler_path)
+        logger.info("Loaded saved global dataset scaler.")
+    else:
+        _shared_scaler = _loader.fit_scaler()
+        logger.info("Global dataset scaler initialized successfully (fitted on fly).")
     
     from aura.split_manager import get_canonical_split
 
@@ -317,7 +315,8 @@ def run_experiment(
     rare_client:     bool = False,
     mode:            str = "dc_fltrust",
     num_rounds:      int = 10,
-    attack_mode:     str = "none"
+    attack_mode:     str = "none",
+    seed:            int = None
 ):
     """
     Run the AURA federation loop locally (no gRPC/Flower overhead).
@@ -703,7 +702,7 @@ def main():
     
     num_clients = 5
     ratio = 0.2  # 1 byzantine client
-    run_experiment("FLTrust", num_clients, byzantine_ratio=ratio, mode=args.mode, num_rounds=args.rounds, attack_mode=args.attack_mode)
+    run_experiment("FLTrust", num_clients, byzantine_ratio=ratio, mode=args.mode, num_rounds=args.rounds, attack_mode=args.attack_mode, seed=args.seed)
 
     print("\n" + "=" * 70)
     print("  Byzantine Benchmark Complete.")

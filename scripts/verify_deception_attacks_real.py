@@ -18,6 +18,7 @@ from scripts.experiments.byzantine_deception_experiment import _run_latent_inver
 from aura.fl_server import ae_only_fltrust_aggregate, joint_dual_fltrust_aggregate, dc_fltrust_aggregate
 
 def measure_head_auroc(global_ae, test_benign, test_attack):
+    from sklearn.metrics import roc_auc_score
     # Measure the AE's discriminative ability using MSE reconstruction error
     global_ae.eval()
     with torch.no_grad():
@@ -267,7 +268,13 @@ def run_single_seed_sequential(seed, modes, attack_mode, rounds, x_benign, x_att
 def main():
     print("=== Extracting canonical test split ===")
     loader = CICIDSDataLoader()
-    scaler = loader.fit_scaler()
+    import joblib
+    import os
+    scaler_path = os.path.join(cfg.MODELS_DIR, "scaler.joblib")
+    if os.path.exists(scaler_path):
+        scaler = joblib.load(scaler_path)
+    else:
+        scaler = loader.fit_scaler()
     
     global_ae = FlowAutoencoder()
     import os
